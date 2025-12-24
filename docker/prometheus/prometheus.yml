@@ -1,0 +1,23 @@
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+scrape_configs:
+  # Prometheus self-monitoring
+  - job_name: 'prometheus'
+    static_configs:
+      - targets: ['localhost:9090']
+
+  # FIBRE metrics exporter running on host machine
+  # host.docker.internal resolves to the host's IP from within Docker
+  - job_name: 'fibre'
+    scrape_interval: 10s
+    static_configs:
+      - targets: ['host.docker.internal:9435']
+        labels:
+          node: 'mynode'
+
+  # Add more FIBRE nodes here for multi-node monitoring:
+  # - targets: ['192.168.1.10:9435', '192.168.1.11:9435']
+  #   labels:
+  #     network: 'mainnet'
