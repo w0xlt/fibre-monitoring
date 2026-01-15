@@ -16,6 +16,9 @@ scrape_configs:
       - targets: ['host.docker.internal:9435']
         labels:
           node: 'mynode'
+      - targets: ['<IP>:9435']
+        labels:
+          node: 'london_node'
 
   # Add more FIBRE nodes here for multi-node monitoring:
   # - targets: ['192.168.1.10:9435', '192.168.1.11:9435']
