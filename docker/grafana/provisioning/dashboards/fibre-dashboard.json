@@ -510,6 +510,102 @@
       ],
       "title": "📈 Chunk Efficiency (Used/Received)",
       "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "loki", "uid": "loki" },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "thresholds" },
+          "custom": {
+            "align": "auto",
+            "cellOptions": { "type": "auto" },
+            "inspect": false
+          },
+          "mappings": [
+            { "options": { "FIBRE/UDP": { "color": "green", "index": 0, "text": "UDP" } }, "type": "value" },
+            { "options": { "BIP152/CMPCTBLOCK": { "color": "orange", "index": 1, "text": "Compact" } }, "type": "value" }
+          ],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [{ "color": "text", "value": null }]
+          }
+        },
+        "overrides": [
+          {
+            "matcher": { "id": "byName", "options": "Winner" },
+            "properties": [
+              { "id": "custom.cellOptions", "value": { "type": "color-text" } },
+              { "id": "mappings", "value": [
+                { "options": { "FIBRE/UDP": { "color": "green", "index": 0, "text": "UDP" } }, "type": "value" },
+                { "options": { "BIP152/CMPCTBLOCK": { "color": "orange", "index": 1, "text": "Compact" } }, "type": "value" }
+              ]}
+            ]
+          },
+          {
+            "matcher": { "id": "byName", "options": "Block Hash" },
+            "properties": [
+              { "id": "custom.width", "value": 180 }
+            ]
+          }
+        ]
+      },
+      "gridPos": { "h": 10, "w": 24, "x": 0, "y": 31 },
+      "id": 20,
+      "options": {
+        "cellHeight": "sm",
+        "footer": { "countRows": false, "fields": "", "reducer": ["sum"], "show": false },
+        "showHeader": true,
+        "sortBy": [{ "desc": true, "displayName": "Time" }]
+      },
+      "targets": [
+        {
+          "datasource": { "type": "loki", "uid": "loki" },
+          "editorMode": "code",
+          "expr": "{job=\"bitcoin\", winner=~\".+\"}",
+          "queryType": "range",
+          "refId": "A"
+        }
+      ],
+      "title": "Block Race Results",
+      "transformations": [
+        {
+          "id": "extractFields",
+          "options": {
+            "source": "labels"
+          }
+        },
+        {
+          "id": "organize",
+          "options": {
+            "excludeByName": {
+              "Line": true,
+              "id": true,
+              "tsNs": true,
+              "labels": true,
+              "job": true,
+              "filename": true,
+              "service_name": true,
+              "level": true,
+              "labelTypes": true
+            },
+            "indexByName": {
+              "Time": 0,
+              "height": 1,
+              "block_hash": 2,
+              "node": 3,
+              "winner": 4
+            },
+            "renameByName": {
+              "Time": "Time",
+              "height": "Height",
+              "block_hash": "Block Hash",
+              "node": "Node",
+              "winner": "Winner"
+            }
+          }
+        }
+      ],
+      "type": "table"
     }
   ],
   "refresh": "10s",

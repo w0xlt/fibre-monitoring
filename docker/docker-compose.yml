@@ -20,6 +20,31 @@ services:
     networks:
       - fibre-network
 
+  loki:
+    image: grafana/loki:3.0.0
+    container_name: fibre-loki
+    restart: unless-stopped
+    ports:
+      - "3100:3100"
+    volumes:
+      - loki_data:/loki
+    command: -config.file=/etc/loki/local-config.yaml
+    networks:
+      - fibre-network
+
+  promtail:
+    image: grafana/promtail:3.0.0
+    container_name: fibre-promtail
+    restart: unless-stopped
+    volumes:
+      - ./promtail/promtail.yml:/etc/promtail/promtail.yml:ro
+      - /home/node/.bitcoin:/var/log/bitcoin:ro
+    command: -config.file=/etc/promtail/promtail.yml
+    depends_on:
+      - loki
+    networks:
+      - fibre-network
+
   grafana:
     image: grafana/grafana:12.3.0
     container_name: fibre-grafana
@@ -35,12 +60,14 @@ services:
       - ./grafana/provisioning:/etc/grafana/provisioning:ro
     depends_on:
       - prometheus
+      - loki
     networks:
       - fibre-network
 
 volumes:
   prometheus_data:
   grafana_data:
+  loki_data:
 
 networks:
   fibre-network:
