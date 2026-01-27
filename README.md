@@ -67,6 +67,7 @@ sudo .venv/bin/python3 fibre_exporter.py \
 | `--pid`, `-p` | No | Auto-detect | PID of running bitcoind |
 | `--node-name`, `-n` | No | localhost | Label for this node in metrics |
 | `--port` | No | 9435 | Prometheus metrics port |
+| `--health-port` | No | 9436 | Health check endpoint port |
 
 ### Verifying the Exporter
 
@@ -75,6 +76,7 @@ Once running, you should see output like:
 FIBRE USDT Metrics Exporter
   bitcoind: /path/to/bitcoind
   port: 9435
+  health_port: 9436
   node: mynode
   ✓ Attached: udp:block_reconstructed
   ✓ Attached: udp:block_send_start
@@ -84,12 +86,17 @@ FIBRE USDT Metrics Exporter
   4/4 probes attached successfully
 
 Prometheus metrics available at http://0.0.0.0:9435/metrics
+Health check available at http://0.0.0.0:9436/health
 Waiting for FIBRE events...
 ```
 
-Test metrics endpoint:
+Test endpoints:
 ```bash
+# Metrics endpoint
 curl http://localhost:9435/metrics
+
+# Health check endpoint
+curl http://localhost:9436/health
 ```
 
 ## Running the Monitoring Stack
@@ -235,7 +242,29 @@ docker compose down -v
 docker compose up -d
 ```
 
+## Running as a Systemd Service
+
+For production deployments, use the provided systemd service file:
+
+```bash
+# Copy and edit the service file
+sudo cp fibre-exporter.service /etc/systemd/system/
+sudo nano /etc/systemd/system/fibre-exporter.service
+# Adjust paths: WorkingDirectory, ExecStart --bitcoind path
+
+# Reload systemd and enable the service
+sudo systemctl daemon-reload
+sudo systemctl enable fibre-exporter
+sudo systemctl start fibre-exporter
+
+# Check status
+sudo systemctl status fibre-exporter
+sudo journalctl -u fibre-exporter -f
+```
+
 ## Metrics Reference
+
+### FIBRE Metrics
 
 | Metric | Type | Description |
 |--------|------|-------------|
@@ -251,11 +280,23 @@ docker compose up -d
 | `fibre_races_with_both_total` | Counter | Races where both mechanisms participated |
 | `fibre_last_block_height` | Gauge | Height of most recently processed block |
 
+### Exporter Self-Monitoring Metrics
+
+| Metric | Type | Description |
+|--------|------|-------------|
+| `fibre_exporter_up` | Gauge | Whether the exporter is running (1 = up) |
+| `fibre_exporter_start_time_seconds` | Gauge | Unix timestamp when exporter started |
+| `fibre_exporter_events_processed_total` | Counter | Total events processed by type |
+| `fibre_exporter_errors_total` | Counter | Total errors encountered by type |
+| `fibre_exporter_probes_attached` | Gauge | Number of USDT probes attached |
+| `fibre_exporter_info` | Info | Exporter version and configuration |
+
 ## File Structure
 
 ```
 fibre-monitoring/
 ├── fibre_exporter.py              # Main metrics exporter
+├── fibre-exporter.service         # Systemd service file
 ├── README.md                       # This file
 └── docker/
     ├── docker-compose.yml          # Container orchestration

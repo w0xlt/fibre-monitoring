@@ -1,0 +1,39 @@
+[Unit]
+Description=FIBRE USDT Metrics Exporter
+Documentation=https://github.com/user/fibre-monitoring
+After=network.target bitcoind.service
+Wants=bitcoind.service
+
+[Service]
+Type=simple
+User=root
+Group=root
+
+# Path to the exporter - adjust as needed
+WorkingDirectory=/opt/fibre-monitoring
+ExecStart=/opt/fibre-monitoring/.venv/bin/python3 /opt/fibre-monitoring/fibre_exporter.py \
+    --bitcoind /usr/local/bin/bitcoind \
+    --node-name %H \
+    --port 9435 \
+    --health-port 9436
+
+# Restart on failure
+Restart=on-failure
+RestartSec=10
+
+# Security hardening (limited due to eBPF requirements)
+NoNewPrivileges=no
+ProtectSystem=strict
+ProtectHome=read-only
+PrivateTmp=true
+
+# Environment
+Environment=PYTHONUNBUFFERED=1
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=fibre-exporter
+
+[Install]
+WantedBy=multi-user.target

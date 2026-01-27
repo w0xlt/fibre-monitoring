@@ -7,8 +7,10 @@ Captures block relay performance from bitcoind USDT tracepoints
 import sys
 import time
 import argparse
+import threading
+from http.server import HTTPServer, BaseHTTPRequestHandler
 from bcc import BPF, USDT
-from prometheus_client import start_http_server, Counter, Histogram, Gauge
+from prometheus_client import start_http_server, Counter, Histogram, Gauge, Info
 
 # ============================================================================
 # Prometheus Metrics
@@ -82,6 +84,42 @@ LAST_BLOCK_HEIGHT = Gauge(
     'fibre_last_block_height',
     'Height of most recently processed block',
     ['node']
+)
+
+# ============================================================================
+# Exporter Self-Monitoring Metrics
+# ============================================================================
+
+EXPORTER_UP = Gauge(
+    'fibre_exporter_up',
+    'Whether the FIBRE exporter is running (1 = up, 0 = down)'
+)
+
+EXPORTER_START_TIME = Gauge(
+    'fibre_exporter_start_time_seconds',
+    'Unix timestamp when the exporter started'
+)
+
+EXPORTER_EVENTS_TOTAL = Counter(
+    'fibre_exporter_events_processed_total',
+    'Total number of events processed by the exporter',
+    ['event_type']
+)
+
+EXPORTER_ERRORS_TOTAL = Counter(
+    'fibre_exporter_errors_total',
+    'Total number of errors encountered by the exporter',
+    ['error_type']
+)
+
+EXPORTER_PROBES_ATTACHED = Gauge(
+    'fibre_exporter_probes_attached',
+    'Number of USDT probes successfully attached'
+)
+
+EXPORTER_INFO = Info(
+    'fibre_exporter',
+    'Information about the FIBRE exporter'
 )
 
 # ============================================================================
@@ -164,49 +202,98 @@ int trace_race_time(struct pt_regs *ctx) {
 # Event Handler
 # ============================================================================
 
-def handle_event(cpu, data, size, node_name):
-    event = bpf["events"].event(data)
-    
-    if event.type == 1:  # BLOCK_RECONSTRUCTED
-        duration_sec = event.duration_us / 1_000_000.0
-        BLOCKS_RECONSTRUCTED.labels(node=node_name).inc()
-        BLOCK_RECONSTRUCTION_TIME.labels(node=node_name).observe(duration_sec)
-        CHUNKS_USED.labels(node=node_name).observe(event.chunks_used)
-        CHUNKS_USED_TOTAL.labels(node=node_name).inc(event.chunks_used)
-        CHUNKS_RECEIVED.labels(node=node_name).inc(event.chunks_recvd)
-        
-    elif event.type == 2:  # BLOCK_SEND_START
-        BLOCKS_SENT.labels(node=node_name).inc()
-        
-    elif event.type == 3:  # RACE_WINNER
-        winner_str = event.winner.decode('utf-8', errors='ignore').rstrip('\x00')
-        if winner_str.startswith('F'):
-            mechanism = 'fibre_udp'
-        elif winner_str.startswith('B'):
-            mechanism = 'bip152_cmpct'
+# ============================================================================
+# Health Check Server
+# ============================================================================
+
+class HealthCheckHandler(BaseHTTPRequestHandler):
+    """Simple HTTP handler for health checks."""
+
+    def do_GET(self):
+        if self.path == '/health' or self.path == '/ready':
+            self.send_response(200)
+            self.send_header('Content-Type', 'text/plain')
+            self.end_headers()
+            self.wfile.write(b'OK')
         else:
-            mechanism = 'other'
-        
-        RACE_WINS.labels(node=node_name, mechanism=mechanism).inc()
-        LAST_BLOCK_HEIGHT.labels(node=node_name).set(event.height)
-        
-    elif event.type == 4:  # RACE_TIME
-        LAST_BLOCK_HEIGHT.labels(node=node_name).set(event.height)
-        
-        if event.udp_ns >= 0:
-            RACE_LATENCY.labels(node=node_name, mechanism='fibre_udp').observe(event.udp_ns / 1_000_000_000.0)
-        
-        if event.cmpct_ns >= 0:
-            RACE_LATENCY.labels(node=node_name, mechanism='bip152_cmpct').observe(event.cmpct_ns / 1_000_000_000.0)
-        
-        if event.udp_ns >= 0 and event.cmpct_ns >= 0:
-            RACES_WITH_BOTH.labels(node=node_name).inc()
-            if event.udp_ns <= event.cmpct_ns:
-                margin = (event.cmpct_ns - event.udp_ns) / 1_000_000_000.0
-                RACE_MARGIN.labels(node=node_name, winner='fibre_udp').observe(margin)
+            self.send_response(404)
+            self.send_header('Content-Type', 'text/plain')
+            self.end_headers()
+            self.wfile.write(b'Not Found')
+
+    def log_message(self, format, *args):
+        # Suppress default logging
+        pass
+
+
+def start_health_server(port):
+    """Start health check server in a background thread."""
+    server = HTTPServer(('0.0.0.0', port), HealthCheckHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    return server
+
+
+# ============================================================================
+# Event Handler
+# ============================================================================
+
+EVENT_TYPE_NAMES = {
+    1: 'block_reconstructed',
+    2: 'block_send_start',
+    3: 'race_winner',
+    4: 'race_time',
+}
+
+def handle_event(cpu, data, size, node_name):
+    try:
+        event = bpf["events"].event(data)
+        event_type_name = EVENT_TYPE_NAMES.get(event.type, 'unknown')
+        EXPORTER_EVENTS_TOTAL.labels(event_type=event_type_name).inc()
+
+        if event.type == 1:  # BLOCK_RECONSTRUCTED
+            duration_sec = event.duration_us / 1_000_000.0
+            BLOCKS_RECONSTRUCTED.labels(node=node_name).inc()
+            BLOCK_RECONSTRUCTION_TIME.labels(node=node_name).observe(duration_sec)
+            CHUNKS_USED.labels(node=node_name).observe(event.chunks_used)
+            CHUNKS_USED_TOTAL.labels(node=node_name).inc(event.chunks_used)
+            CHUNKS_RECEIVED.labels(node=node_name).inc(event.chunks_recvd)
+
+        elif event.type == 2:  # BLOCK_SEND_START
+            BLOCKS_SENT.labels(node=node_name).inc()
+
+        elif event.type == 3:  # RACE_WINNER
+            winner_str = event.winner.decode('utf-8', errors='ignore').rstrip('\x00')
+            if winner_str.startswith('F'):
+                mechanism = 'fibre_udp'
+            elif winner_str.startswith('B'):
+                mechanism = 'bip152_cmpct'
             else:
-                margin = (event.udp_ns - event.cmpct_ns) / 1_000_000_000.0
-                RACE_MARGIN.labels(node=node_name, winner='bip152_cmpct').observe(margin)
+                mechanism = 'other'
+
+            RACE_WINS.labels(node=node_name, mechanism=mechanism).inc()
+            LAST_BLOCK_HEIGHT.labels(node=node_name).set(event.height)
+
+        elif event.type == 4:  # RACE_TIME
+            LAST_BLOCK_HEIGHT.labels(node=node_name).set(event.height)
+
+            if event.udp_ns >= 0:
+                RACE_LATENCY.labels(node=node_name, mechanism='fibre_udp').observe(event.udp_ns / 1_000_000_000.0)
+
+            if event.cmpct_ns >= 0:
+                RACE_LATENCY.labels(node=node_name, mechanism='bip152_cmpct').observe(event.cmpct_ns / 1_000_000_000.0)
+
+            if event.udp_ns >= 0 and event.cmpct_ns >= 0:
+                RACES_WITH_BOTH.labels(node=node_name).inc()
+                if event.udp_ns <= event.cmpct_ns:
+                    margin = (event.cmpct_ns - event.udp_ns) / 1_000_000_000.0
+                    RACE_MARGIN.labels(node=node_name, winner='fibre_udp').observe(margin)
+                else:
+                    margin = (event.udp_ns - event.cmpct_ns) / 1_000_000_000.0
+                    RACE_MARGIN.labels(node=node_name, winner='bip152_cmpct').observe(margin)
+    except Exception as e:
+        EXPORTER_ERRORS_TOTAL.labels(error_type='event_processing').inc()
+        print(f"Error processing event: {e}")
 
 # ============================================================================
 # Main
@@ -217,12 +304,22 @@ def main():
     parser.add_argument('--bitcoind', '-b', required=True, help='Path to bitcoind binary')
     parser.add_argument('--pid', '-p', type=int, help='PID of running bitcoind (optional)')
     parser.add_argument('--port', type=int, default=9435, help='Prometheus metrics port (default: 9435)')
+    parser.add_argument('--health-port', type=int, default=9436, help='Health check port (default: 9436)')
     parser.add_argument('--node-name', '-n', default='localhost', help='Node name label')
     args = parser.parse_args()
-    
+
+    # Set exporter info
+    EXPORTER_INFO.info({
+        'version': '1.0.0',
+        'node_name': args.node_name,
+        'bitcoind_path': args.bitcoind,
+    })
+    EXPORTER_START_TIME.set(time.time())
+
     print(f"FIBRE USDT Metrics Exporter")
     print(f"  bitcoind: {args.bitcoind}")
     print(f"  port: {args.port}")
+    print(f"  health_port: {args.health_port}")
     print(f"  node: {args.node_name}")
     
     # Set up USDT probes
@@ -245,6 +342,7 @@ def main():
             print(f"  ✗ Failed to attach {probe_name}: {e}")
 
     if attached_count == 0:
+        EXPORTER_UP.set(0)
         print("\nERROR: No USDT probes could be attached.")
         print("Possible causes:")
         print("  - bitcoind was not compiled with USDT tracepoint support")
@@ -252,6 +350,7 @@ def main():
         print("  - Insufficient permissions (try running with sudo)")
         sys.exit(1)
 
+    EXPORTER_PROBES_ATTACHED.set(attached_count)
     print(f"\n  {attached_count}/{len(probes)} probes attached successfully")
     
     # Load BPF program
@@ -263,10 +362,18 @@ def main():
         handle_event(cpu, data, size, args.node_name)
     
     bpf["events"].open_perf_buffer(_handle_event)
-    
+
     # Start Prometheus HTTP server
     start_http_server(args.port)
+
+    # Start health check server
+    start_health_server(args.health_port)
+
+    # Mark exporter as up
+    EXPORTER_UP.set(1)
+
     print(f"\nPrometheus metrics available at http://0.0.0.0:{args.port}/metrics")
+    print(f"Health check available at http://0.0.0.0:{args.health_port}/health")
     print("Waiting for FIBRE events...\n")
     
     # Poll for events
@@ -274,6 +381,7 @@ def main():
         while True:
             bpf.perf_buffer_poll(timeout=1000)
     except KeyboardInterrupt:
+        EXPORTER_UP.set(0)
         print("\nShutting down...")
 
 if __name__ == "__main__":
