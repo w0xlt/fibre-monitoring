@@ -44,7 +44,7 @@ sudo apt install bpfcc-tools python3-bpfcc python3-venv
 ```bash
 python3 -m venv .venv --system-site-packages
 source .venv/bin/activate
-pip install prometheus_client
+pip install prometheus_client pyyaml
 ```
 
 ## Running the Exporter
@@ -63,31 +63,78 @@ sudo .venv/bin/python3 fibre_exporter.py \
 
 | Argument | Required | Default | Description |
 |----------|----------|---------|-------------|
-| `--bitcoind`, `-b` | Yes | - | Path to bitcoind binary |
+| `--bitcoind`, `-b` | Yes* | - | Path to bitcoind binary |
 | `--pid`, `-p` | No | Auto-detect | PID of running bitcoind |
 | `--node-name`, `-n` | No | localhost | Label for this node in metrics |
 | `--port` | No | 9435 | Prometheus metrics port |
 | `--health-port` | No | 9436 | Health check endpoint port |
+| `--config`, `-c` | No | - | Path to YAML config file |
+| `--verbose`, `-v` | No | false | Log individual events |
+| `--log-level` | No | INFO | Log level (DEBUG, INFO, WARNING, ERROR) |
+| `--version` | No | - | Show version and exit |
+
+*Required unless provided via config file or environment variable.
+
+### Configuration File
+
+Instead of command-line arguments, you can use a YAML config file:
+
+```bash
+cp config.example.yaml config.yaml
+# Edit config.yaml with your settings
+sudo .venv/bin/python3 fibre_exporter.py --config config.yaml
+```
+
+Example `config.yaml`:
+```yaml
+bitcoind_path: /usr/local/bin/bitcoind
+node_name: mynode
+metrics_port: 9435
+health_port: 9436
+verbose: false
+log_level: INFO
+```
+
+### Environment Variables
+
+All settings can also be configured via environment variables:
+
+| Variable | Description |
+|----------|-------------|
+| `FIBRE_BITCOIND_PATH` | Path to bitcoind binary |
+| `FIBRE_PID` | PID of running bitcoind |
+| `FIBRE_NODE_NAME` | Node name label |
+| `FIBRE_METRICS_PORT` | Prometheus metrics port |
+| `FIBRE_HEALTH_PORT` | Health check port |
+| `FIBRE_VERBOSE` | Enable verbose logging (true/false) |
+| `FIBRE_LOG_LEVEL` | Log level (DEBUG, INFO, WARNING, ERROR) |
+
+Configuration priority (highest to lowest):
+1. Command-line arguments
+2. Environment variables
+3. Config file
+4. Defaults
 
 ### Verifying the Exporter
 
 Once running, you should see output like:
 ```
-FIBRE USDT Metrics Exporter
-  bitcoind: /path/to/bitcoind
-  port: 9435
-  health_port: 9436
-  node: mynode
-  ✓ Attached: udp:block_reconstructed
-  ✓ Attached: udp:block_send_start
-  ✓ Attached: udp:block_race_winner
-  ✓ Attached: udp:block_race_time
+2024-01-15 10:30:00 [INFO] fibre_exporter: FIBRE USDT Metrics Exporter v1.1.0
+2024-01-15 10:30:00 [INFO] fibre_exporter: Configuration: bitcoind=/path/to/bitcoind node=mynode port=9435
+2024-01-15 10:30:00 [INFO] fibre_exporter: Attached probe: udp:block_reconstructed
+2024-01-15 10:30:00 [INFO] fibre_exporter: Attached probe: udp:block_send_start
+2024-01-15 10:30:00 [INFO] fibre_exporter: Attached probe: udp:block_race_winner
+2024-01-15 10:30:00 [INFO] fibre_exporter: Attached probe: udp:block_race_time
+2024-01-15 10:30:00 [INFO] fibre_exporter: Attached 4/4 probes successfully
+2024-01-15 10:30:00 [INFO] fibre_exporter: Prometheus metrics: http://0.0.0.0:9435/metrics
+2024-01-15 10:30:00 [INFO] fibre_exporter: Health check: http://0.0.0.0:9436/health
+2024-01-15 10:30:00 [INFO] fibre_exporter: Waiting for FIBRE events...
+```
 
-  4/4 probes attached successfully
-
-Prometheus metrics available at http://0.0.0.0:9435/metrics
-Health check available at http://0.0.0.0:9436/health
-Waiting for FIBRE events...
+With `--verbose` mode, individual events are also logged:
+```
+2024-01-15 10:35:12 [INFO] fibre_exporter: Race winner: height=876543 winner=fibre_udp
+2024-01-15 10:35:12 [INFO] fibre_exporter: Race time: height=876543 udp=0.045s cmpct=0.089s
 ```
 
 Test endpoints:
@@ -297,6 +344,7 @@ sudo journalctl -u fibre-exporter -f
 fibre-monitoring/
 ├── fibre_exporter.py              # Main metrics exporter
 ├── fibre-exporter.service         # Systemd service file
+├── config.example.yaml            # Example configuration file
 ├── README.md                       # This file
 └── docker/
     ├── docker-compose.yml          # Container orchestration

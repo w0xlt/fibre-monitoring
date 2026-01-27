@@ -1,0 +1,23 @@
+# FIBRE Exporter Configuration
+# Copy this file to config.yaml and customize as needed
+
+# Path to bitcoind binary (required)
+bitcoind_path: /usr/local/bin/bitcoind
+
+# PID of running bitcoind (optional, auto-detected if not specified)
+# pid: 12345
+
+# Node name label for metrics (default: localhost)
+node_name: mynode
+
+# Prometheus metrics port (default: 9435)
+metrics_port: 9435
+
+# Health check port (default: 9436)
+health_port: 9436
+
+# Enable verbose logging of individual events (default: false)
+verbose: false
+
+# Log level: DEBUG, INFO, WARNING, ERROR (default: INFO)
+log_level: INFO

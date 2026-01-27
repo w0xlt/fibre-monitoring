@@ -4,123 +4,232 @@ FIBRE USDT Metrics Exporter for Prometheus
 Captures block relay performance from bitcoind USDT tracepoints
 """
 
-import sys
-import time
+from __future__ import annotations
+
 import argparse
+import logging
+import os
+import sys
 import threading
-from http.server import HTTPServer, BaseHTTPRequestHandler
+import time
+from dataclasses import dataclass, field
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from pathlib import Path
+from typing import Any, Optional
+
 from bcc import BPF, USDT
-from prometheus_client import start_http_server, Counter, Histogram, Gauge, Info
+from prometheus_client import Counter, Gauge, Histogram, Info, start_http_server
+
+# ============================================================================
+# Version
+# ============================================================================
+
+__version__ = "1.1.0"
+
+# ============================================================================
+# Configuration
+# ============================================================================
+
+
+@dataclass
+class ExporterConfig:
+    """Configuration for the FIBRE exporter."""
+
+    bitcoind_path: str
+    pid: Optional[int] = None
+    node_name: str = "localhost"
+    metrics_port: int = 9435
+    health_port: int = 9436
+    verbose: bool = False
+    log_level: str = "INFO"
+
+    @classmethod
+    def from_args(cls, args: argparse.Namespace) -> ExporterConfig:
+        """Create config from parsed arguments."""
+        return cls(
+            bitcoind_path=args.bitcoind,
+            pid=args.pid,
+            node_name=args.node_name,
+            metrics_port=args.port,
+            health_port=args.health_port,
+            verbose=args.verbose,
+            log_level=args.log_level,
+        )
+
+    @classmethod
+    def from_yaml(cls, path: Path) -> ExporterConfig:
+        """Load config from YAML file."""
+        import yaml
+
+        with open(path) as f:
+            data = yaml.safe_load(f)
+
+        return cls(
+            bitcoind_path=data.get("bitcoind_path", data.get("bitcoind")),
+            pid=data.get("pid"),
+            node_name=data.get("node_name", "localhost"),
+            metrics_port=data.get("metrics_port", data.get("port", 9435)),
+            health_port=data.get("health_port", 9436),
+            verbose=data.get("verbose", False),
+            log_level=data.get("log_level", "INFO"),
+        )
+
+    @classmethod
+    def from_env(cls, base_config: Optional[ExporterConfig] = None) -> ExporterConfig:
+        """Override config from environment variables."""
+        if base_config is None:
+            base_config = cls(bitcoind_path="")
+
+        return cls(
+            bitcoind_path=os.environ.get("FIBRE_BITCOIND_PATH", base_config.bitcoind_path),
+            pid=int(os.environ["FIBRE_PID"]) if "FIBRE_PID" in os.environ else base_config.pid,
+            node_name=os.environ.get("FIBRE_NODE_NAME", base_config.node_name),
+            metrics_port=int(os.environ.get("FIBRE_METRICS_PORT", base_config.metrics_port)),
+            health_port=int(os.environ.get("FIBRE_HEALTH_PORT", base_config.health_port)),
+            verbose=os.environ.get("FIBRE_VERBOSE", str(base_config.verbose)).lower() == "true",
+            log_level=os.environ.get("FIBRE_LOG_LEVEL", base_config.log_level),
+        )
+
+
+# ============================================================================
+# Logging Setup
+# ============================================================================
+
+
+def setup_logging(level: str = "INFO") -> logging.Logger:
+    """Configure structured logging."""
+    log_level = getattr(logging, level.upper(), logging.INFO)
+
+    # Create formatter
+    formatter = logging.Formatter(
+        fmt="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+
+    # Configure root logger
+    handler = logging.StreamHandler(sys.stdout)
+    handler.setFormatter(formatter)
+
+    logger = logging.getLogger("fibre_exporter")
+    logger.setLevel(log_level)
+    logger.addHandler(handler)
+
+    return logger
+
 
 # ============================================================================
 # Prometheus Metrics
 # ============================================================================
 
-BLOCKS_RECONSTRUCTED = Counter(
-    'fibre_blocks_reconstructed_total',
-    'Total blocks reconstructed via FIBRE/UDP',
-    ['node']
-)
 
-BLOCK_RECONSTRUCTION_TIME = Histogram(
-    'fibre_block_reconstruction_duration_seconds',
-    'Block reconstruction time',
-    ['node'],
-    buckets=[0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0]
-)
+@dataclass
+class FibreMetrics:
+    """Container for all Prometheus metrics."""
 
-CHUNKS_USED = Histogram(
-    'fibre_block_chunks_used',
-    'Number of chunks used per block',
-    ['node'],
-    buckets=[1, 2, 5, 10, 20, 50, 100, 200, 500, 1000, 2000, 5000]
-)
+    # FIBRE metrics
+    blocks_reconstructed: Counter = field(default_factory=lambda: Counter(
+        "fibre_blocks_reconstructed_total",
+        "Total blocks reconstructed via FIBRE/UDP",
+        ["node"],
+    ))
 
-CHUNKS_RECEIVED = Counter(
-    'fibre_chunks_received_total',
-    'Total chunks received',
-    ['node']
-)
+    block_reconstruction_time: Histogram = field(default_factory=lambda: Histogram(
+        "fibre_block_reconstruction_duration_seconds",
+        "Block reconstruction time",
+        ["node"],
+        buckets=[0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0],
+    ))
 
-CHUNKS_USED_TOTAL = Counter(
-    'fibre_chunks_used_total',
-    'Total chunks used',
-    ['node']
-)
+    chunks_used: Histogram = field(default_factory=lambda: Histogram(
+        "fibre_block_chunks_used",
+        "Number of chunks used per block",
+        ["node"],
+        buckets=[1, 2, 5, 10, 20, 50, 100, 200, 500, 1000, 2000, 5000],
+    ))
 
-BLOCKS_SENT = Counter(
-    'fibre_blocks_sent_total',
-    'Total blocks sent via FIBRE/UDP',
-    ['node']
-)
+    chunks_received: Counter = field(default_factory=lambda: Counter(
+        "fibre_chunks_received_total",
+        "Total chunks received",
+        ["node"],
+    ))
 
-RACE_WINS = Counter(
-    'fibre_block_race_wins_total',
-    'Block race wins by mechanism',
-    ['node', 'mechanism']
-)
+    chunks_used_total: Counter = field(default_factory=lambda: Counter(
+        "fibre_chunks_used_total",
+        "Total chunks used",
+        ["node"],
+    ))
 
-RACE_LATENCY = Histogram(
-    'fibre_block_race_latency_seconds',
-    'Block race latency by mechanism',
-    ['node', 'mechanism'],
-    buckets=[0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.0, 5.0, 10.0]
-)
+    blocks_sent: Counter = field(default_factory=lambda: Counter(
+        "fibre_blocks_sent_total",
+        "Total blocks sent via FIBRE/UDP",
+        ["node"],
+    ))
 
-RACE_MARGIN = Histogram(
-    'fibre_race_margin_seconds',
-    'Race margin (how much faster winner was)',
-    ['node', 'winner'],
-    buckets=[0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.5, 1.0]
-)
+    race_wins: Counter = field(default_factory=lambda: Counter(
+        "fibre_block_race_wins_total",
+        "Block race wins by mechanism",
+        ["node", "mechanism"],
+    ))
 
-RACES_WITH_BOTH = Counter(
-    'fibre_races_with_both_total',
-    'Races where both mechanisms participated',
-    ['node']
-)
+    race_latency: Histogram = field(default_factory=lambda: Histogram(
+        "fibre_block_race_latency_seconds",
+        "Block race latency by mechanism",
+        ["node", "mechanism"],
+        buckets=[0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.0, 5.0, 10.0],
+    ))
 
-LAST_BLOCK_HEIGHT = Gauge(
-    'fibre_last_block_height',
-    'Height of most recently processed block',
-    ['node']
-)
+    race_margin: Histogram = field(default_factory=lambda: Histogram(
+        "fibre_race_margin_seconds",
+        "Race margin (how much faster winner was)",
+        ["node", "winner"],
+        buckets=[0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.5, 1.0],
+    ))
 
-# ============================================================================
-# Exporter Self-Monitoring Metrics
-# ============================================================================
+    races_with_both: Counter = field(default_factory=lambda: Counter(
+        "fibre_races_with_both_total",
+        "Races where both mechanisms participated",
+        ["node"],
+    ))
 
-EXPORTER_UP = Gauge(
-    'fibre_exporter_up',
-    'Whether the FIBRE exporter is running (1 = up, 0 = down)'
-)
+    last_block_height: Gauge = field(default_factory=lambda: Gauge(
+        "fibre_last_block_height",
+        "Height of most recently processed block",
+        ["node"],
+    ))
 
-EXPORTER_START_TIME = Gauge(
-    'fibre_exporter_start_time_seconds',
-    'Unix timestamp when the exporter started'
-)
+    # Exporter self-monitoring metrics
+    exporter_up: Gauge = field(default_factory=lambda: Gauge(
+        "fibre_exporter_up",
+        "Whether the FIBRE exporter is running (1 = up, 0 = down)",
+    ))
 
-EXPORTER_EVENTS_TOTAL = Counter(
-    'fibre_exporter_events_processed_total',
-    'Total number of events processed by the exporter',
-    ['event_type']
-)
+    exporter_start_time: Gauge = field(default_factory=lambda: Gauge(
+        "fibre_exporter_start_time_seconds",
+        "Unix timestamp when the exporter started",
+    ))
 
-EXPORTER_ERRORS_TOTAL = Counter(
-    'fibre_exporter_errors_total',
-    'Total number of errors encountered by the exporter',
-    ['error_type']
-)
+    exporter_events_total: Counter = field(default_factory=lambda: Counter(
+        "fibre_exporter_events_processed_total",
+        "Total number of events processed by the exporter",
+        ["event_type"],
+    ))
 
-EXPORTER_PROBES_ATTACHED = Gauge(
-    'fibre_exporter_probes_attached',
-    'Number of USDT probes successfully attached'
-)
+    exporter_errors_total: Counter = field(default_factory=lambda: Counter(
+        "fibre_exporter_errors_total",
+        "Total number of errors encountered by the exporter",
+        ["error_type"],
+    ))
 
-EXPORTER_INFO = Info(
-    'fibre_exporter',
-    'Information about the FIBRE exporter'
-)
+    exporter_probes_attached: Gauge = field(default_factory=lambda: Gauge(
+        "fibre_exporter_probes_attached",
+        "Number of USDT probes successfully attached",
+    ))
+
+    exporter_info: Info = field(default_factory=lambda: Info(
+        "fibre_exporter",
+        "Information about the FIBRE exporter",
+    ))
+
 
 # ============================================================================
 # BPF Program
@@ -152,12 +261,12 @@ struct event_t {
 int trace_block_reconstructed(struct pt_regs *ctx) {
     struct event_t event = {};
     event.type = EVENT_BLOCK_RECONSTRUCTED;
-    
+
     // Args: block_hash, src, chunks_used, chunks_recvd, num_peers, duration_us
     bpf_usdt_readarg(3, ctx, &event.chunks_used);
     bpf_usdt_readarg(4, ctx, &event.chunks_recvd);
     bpf_usdt_readarg(6, ctx, &event.duration_us);
-    
+
     events.perf_submit(ctx, &event, sizeof(event));
     return 0;
 }
@@ -172,14 +281,14 @@ int trace_block_send_start(struct pt_regs *ctx) {
 int trace_race_winner(struct pt_regs *ctx) {
     struct event_t event = {};
     event.type = EVENT_RACE_WINNER;
-    
+
     // Args: block_hash, height, winner, winner_peer
     bpf_usdt_readarg(2, ctx, &event.height);
-    
+
     u64 winner_ptr;
     bpf_usdt_readarg(3, ctx, &winner_ptr);
     bpf_probe_read_user_str(&event.winner, sizeof(event.winner), (void *)winner_ptr);
-    
+
     events.perf_submit(ctx, &event, sizeof(event));
     return 0;
 }
@@ -187,202 +296,368 @@ int trace_race_winner(struct pt_regs *ctx) {
 int trace_race_time(struct pt_regs *ctx) {
     struct event_t event = {};
     event.type = EVENT_RACE_TIME;
-    
+
     // Args: block_hash, height, udp_ns, udp_peer, cmpct_ns, cmpct_peer
     bpf_usdt_readarg(2, ctx, &event.height);
     bpf_usdt_readarg(3, ctx, &event.udp_ns);
     bpf_usdt_readarg(5, ctx, &event.cmpct_ns);
-    
+
     events.perf_submit(ctx, &event, sizeof(event));
     return 0;
 }
 """
 
 # ============================================================================
-# Event Handler
-# ============================================================================
-
-# ============================================================================
 # Health Check Server
 # ============================================================================
+
 
 class HealthCheckHandler(BaseHTTPRequestHandler):
     """Simple HTTP handler for health checks."""
 
-    def do_GET(self):
-        if self.path == '/health' or self.path == '/ready':
+    def do_GET(self) -> None:
+        if self.path in ("/health", "/ready"):
             self.send_response(200)
-            self.send_header('Content-Type', 'text/plain')
+            self.send_header("Content-Type", "text/plain")
             self.end_headers()
-            self.wfile.write(b'OK')
+            self.wfile.write(b"OK")
         else:
             self.send_response(404)
-            self.send_header('Content-Type', 'text/plain')
+            self.send_header("Content-Type", "text/plain")
             self.end_headers()
-            self.wfile.write(b'Not Found')
+            self.wfile.write(b"Not Found")
 
-    def log_message(self, format, *args):
+    def log_message(self, format: str, *args: Any) -> None:
         # Suppress default logging
         pass
 
 
-def start_health_server(port):
+def start_health_server(port: int) -> HTTPServer:
     """Start health check server in a background thread."""
-    server = HTTPServer(('0.0.0.0', port), HealthCheckHandler)
+    server = HTTPServer(("0.0.0.0", port), HealthCheckHandler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     return server
 
 
 # ============================================================================
-# Event Handler
+# FIBRE Exporter
 # ============================================================================
 
-EVENT_TYPE_NAMES = {
-    1: 'block_reconstructed',
-    2: 'block_send_start',
-    3: 'race_winner',
-    4: 'race_time',
+EVENT_TYPE_NAMES: dict[int, str] = {
+    1: "block_reconstructed",
+    2: "block_send_start",
+    3: "race_winner",
+    4: "race_time",
 }
 
-def handle_event(cpu, data, size, node_name):
-    try:
-        event = bpf["events"].event(data)
-        event_type_name = EVENT_TYPE_NAMES.get(event.type, 'unknown')
-        EXPORTER_EVENTS_TOTAL.labels(event_type=event_type_name).inc()
 
-        if event.type == 1:  # BLOCK_RECONSTRUCTED
-            duration_sec = event.duration_us / 1_000_000.0
-            BLOCKS_RECONSTRUCTED.labels(node=node_name).inc()
-            BLOCK_RECONSTRUCTION_TIME.labels(node=node_name).observe(duration_sec)
-            CHUNKS_USED.labels(node=node_name).observe(event.chunks_used)
-            CHUNKS_USED_TOTAL.labels(node=node_name).inc(event.chunks_used)
-            CHUNKS_RECEIVED.labels(node=node_name).inc(event.chunks_recvd)
+class FibreExporter:
+    """Main FIBRE metrics exporter class."""
 
-        elif event.type == 2:  # BLOCK_SEND_START
-            BLOCKS_SENT.labels(node=node_name).inc()
+    def __init__(self, config: ExporterConfig) -> None:
+        self.config = config
+        self.logger = setup_logging(config.log_level)
+        self.metrics = FibreMetrics()
+        self.bpf: Optional[BPF] = None
+        self._running = False
 
-        elif event.type == 3:  # RACE_WINNER
-            winner_str = event.winner.decode('utf-8', errors='ignore').rstrip('\x00')
-            if winner_str.startswith('F'):
-                mechanism = 'fibre_udp'
-            elif winner_str.startswith('B'):
-                mechanism = 'bip152_cmpct'
-            else:
-                mechanism = 'other'
-
-            RACE_WINS.labels(node=node_name, mechanism=mechanism).inc()
-            LAST_BLOCK_HEIGHT.labels(node=node_name).set(event.height)
-
-        elif event.type == 4:  # RACE_TIME
-            LAST_BLOCK_HEIGHT.labels(node=node_name).set(event.height)
-
-            if event.udp_ns >= 0:
-                RACE_LATENCY.labels(node=node_name, mechanism='fibre_udp').observe(event.udp_ns / 1_000_000_000.0)
-
-            if event.cmpct_ns >= 0:
-                RACE_LATENCY.labels(node=node_name, mechanism='bip152_cmpct').observe(event.cmpct_ns / 1_000_000_000.0)
-
-            if event.udp_ns >= 0 and event.cmpct_ns >= 0:
-                RACES_WITH_BOTH.labels(node=node_name).inc()
-                if event.udp_ns <= event.cmpct_ns:
-                    margin = (event.cmpct_ns - event.udp_ns) / 1_000_000_000.0
-                    RACE_MARGIN.labels(node=node_name, winner='fibre_udp').observe(margin)
-                else:
-                    margin = (event.udp_ns - event.cmpct_ns) / 1_000_000_000.0
-                    RACE_MARGIN.labels(node=node_name, winner='bip152_cmpct').observe(margin)
-    except Exception as e:
-        EXPORTER_ERRORS_TOTAL.labels(error_type='event_processing').inc()
-        print(f"Error processing event: {e}")
-
-# ============================================================================
-# Main
-# ============================================================================
-
-def main():
-    parser = argparse.ArgumentParser(description='FIBRE USDT Metrics Exporter')
-    parser.add_argument('--bitcoind', '-b', required=True, help='Path to bitcoind binary')
-    parser.add_argument('--pid', '-p', type=int, help='PID of running bitcoind (optional)')
-    parser.add_argument('--port', type=int, default=9435, help='Prometheus metrics port (default: 9435)')
-    parser.add_argument('--health-port', type=int, default=9436, help='Health check port (default: 9436)')
-    parser.add_argument('--node-name', '-n', default='localhost', help='Node name label')
-    args = parser.parse_args()
-
-    # Set exporter info
-    EXPORTER_INFO.info({
-        'version': '1.0.0',
-        'node_name': args.node_name,
-        'bitcoind_path': args.bitcoind,
-    })
-    EXPORTER_START_TIME.set(time.time())
-
-    print(f"FIBRE USDT Metrics Exporter")
-    print(f"  bitcoind: {args.bitcoind}")
-    print(f"  port: {args.port}")
-    print(f"  health_port: {args.health_port}")
-    print(f"  node: {args.node_name}")
-    
-    # Set up USDT probes
-    usdt = USDT(path=args.bitcoind, pid=args.pid)
-
-    probes = [
-        ("block_reconstructed", "trace_block_reconstructed"),
-        ("block_send_start", "trace_block_send_start"),
-        ("block_race_winner", "trace_race_winner"),
-        ("block_race_time", "trace_race_time"),
-    ]
-
-    attached_count = 0
-    for probe_name, fn_name in probes:
+    def _handle_event(self, cpu: int, data: Any, size: int) -> None:
+        """Process a single BPF event."""
         try:
-            usdt.enable_probe(probe=probe_name, fn_name=fn_name)
-            print(f"  ✓ Attached: udp:{probe_name}")
-            attached_count += 1
-        except Exception as e:
-            print(f"  ✗ Failed to attach {probe_name}: {e}")
+            event = self.bpf["events"].event(data)
+            event_type_name = EVENT_TYPE_NAMES.get(event.type, "unknown")
+            self.metrics.exporter_events_total.labels(event_type=event_type_name).inc()
 
-    if attached_count == 0:
-        EXPORTER_UP.set(0)
-        print("\nERROR: No USDT probes could be attached.")
-        print("Possible causes:")
-        print("  - bitcoind was not compiled with USDT tracepoint support")
-        print("  - The specified PID is not a bitcoind process")
-        print("  - Insufficient permissions (try running with sudo)")
+            if event.type == 1:  # BLOCK_RECONSTRUCTED
+                self._handle_block_reconstructed(event)
+            elif event.type == 2:  # BLOCK_SEND_START
+                self._handle_block_send_start(event)
+            elif event.type == 3:  # RACE_WINNER
+                self._handle_race_winner(event)
+            elif event.type == 4:  # RACE_TIME
+                self._handle_race_time(event)
+
+        except Exception as e:
+            self.metrics.exporter_errors_total.labels(error_type="event_processing").inc()
+            self.logger.error(f"Error processing event: {e}")
+
+    def _handle_block_reconstructed(self, event: Any) -> None:
+        """Handle block reconstructed event."""
+        node = self.config.node_name
+        duration_sec = event.duration_us / 1_000_000.0
+
+        self.metrics.blocks_reconstructed.labels(node=node).inc()
+        self.metrics.block_reconstruction_time.labels(node=node).observe(duration_sec)
+        self.metrics.chunks_used.labels(node=node).observe(event.chunks_used)
+        self.metrics.chunks_used_total.labels(node=node).inc(event.chunks_used)
+        self.metrics.chunks_received.labels(node=node).inc(event.chunks_recvd)
+
+        if self.config.verbose:
+            self.logger.info(
+                f"Block reconstructed: duration={duration_sec:.3f}s "
+                f"chunks_used={event.chunks_used} chunks_recvd={event.chunks_recvd}"
+            )
+
+    def _handle_block_send_start(self, event: Any) -> None:
+        """Handle block send start event."""
+        self.metrics.blocks_sent.labels(node=self.config.node_name).inc()
+
+        if self.config.verbose:
+            self.logger.info("Block send started")
+
+    def _handle_race_winner(self, event: Any) -> None:
+        """Handle race winner event."""
+        node = self.config.node_name
+        winner_str = event.winner.decode("utf-8", errors="ignore").rstrip("\x00")
+
+        if winner_str.startswith("F"):
+            mechanism = "fibre_udp"
+        elif winner_str.startswith("B"):
+            mechanism = "bip152_cmpct"
+        else:
+            mechanism = "other"
+
+        self.metrics.race_wins.labels(node=node, mechanism=mechanism).inc()
+        self.metrics.last_block_height.labels(node=node).set(event.height)
+
+        if self.config.verbose:
+            self.logger.info(f"Race winner: height={event.height} winner={mechanism}")
+
+    def _handle_race_time(self, event: Any) -> None:
+        """Handle race time event."""
+        node = self.config.node_name
+        self.metrics.last_block_height.labels(node=node).set(event.height)
+
+        udp_latency_sec = None
+        cmpct_latency_sec = None
+
+        if event.udp_ns >= 0:
+            udp_latency_sec = event.udp_ns / 1_000_000_000.0
+            self.metrics.race_latency.labels(node=node, mechanism="fibre_udp").observe(udp_latency_sec)
+
+        if event.cmpct_ns >= 0:
+            cmpct_latency_sec = event.cmpct_ns / 1_000_000_000.0
+            self.metrics.race_latency.labels(node=node, mechanism="bip152_cmpct").observe(cmpct_latency_sec)
+
+        if event.udp_ns >= 0 and event.cmpct_ns >= 0:
+            self.metrics.races_with_both.labels(node=node).inc()
+            if event.udp_ns <= event.cmpct_ns:
+                margin = (event.cmpct_ns - event.udp_ns) / 1_000_000_000.0
+                self.metrics.race_margin.labels(node=node, winner="fibre_udp").observe(margin)
+            else:
+                margin = (event.udp_ns - event.cmpct_ns) / 1_000_000_000.0
+                self.metrics.race_margin.labels(node=node, winner="bip152_cmpct").observe(margin)
+
+        if self.config.verbose:
+            self.logger.info(
+                f"Race time: height={event.height} "
+                f"udp={udp_latency_sec:.3f}s cmpct={cmpct_latency_sec:.3f}s"
+                if udp_latency_sec and cmpct_latency_sec
+                else f"Race time: height={event.height}"
+            )
+
+    def _attach_probes(self) -> int:
+        """Attach USDT probes to bitcoind. Returns number of probes attached."""
+        usdt = USDT(path=self.config.bitcoind_path, pid=self.config.pid)
+
+        probes = [
+            ("block_reconstructed", "trace_block_reconstructed"),
+            ("block_send_start", "trace_block_send_start"),
+            ("block_race_winner", "trace_race_winner"),
+            ("block_race_time", "trace_race_time"),
+        ]
+
+        attached_count = 0
+        for probe_name, fn_name in probes:
+            try:
+                usdt.enable_probe(probe=probe_name, fn_name=fn_name)
+                self.logger.info(f"Attached probe: udp:{probe_name}")
+                attached_count += 1
+            except Exception as e:
+                self.logger.warning(f"Failed to attach probe {probe_name}: {e}")
+
+        if attached_count == 0:
+            return 0
+
+        # Load BPF program
+        self.bpf = BPF(text=BPF_PROGRAM, usdt_contexts=[usdt])
+        self.bpf["events"].open_perf_buffer(self._handle_event)
+
+        return attached_count
+
+    def run(self) -> None:
+        """Run the exporter."""
+        self.logger.info(f"FIBRE USDT Metrics Exporter v{__version__}")
+        self.logger.info(f"Configuration: bitcoind={self.config.bitcoind_path} "
+                        f"node={self.config.node_name} port={self.config.metrics_port}")
+
+        # Set exporter info
+        self.metrics.exporter_info.info({
+            "version": __version__,
+            "node_name": self.config.node_name,
+            "bitcoind_path": self.config.bitcoind_path,
+        })
+        self.metrics.exporter_start_time.set(time.time())
+
+        # Attach probes
+        attached_count = self._attach_probes()
+
+        if attached_count == 0:
+            self.metrics.exporter_up.set(0)
+            self.logger.error("No USDT probes could be attached")
+            self.logger.error("Possible causes:")
+            self.logger.error("  - bitcoind was not compiled with USDT tracepoint support")
+            self.logger.error("  - The specified PID is not a bitcoind process")
+            self.logger.error("  - Insufficient permissions (try running with sudo)")
+            sys.exit(1)
+
+        self.metrics.exporter_probes_attached.set(attached_count)
+        self.logger.info(f"Attached {attached_count}/4 probes successfully")
+
+        # Start servers
+        start_http_server(self.config.metrics_port)
+        start_health_server(self.config.health_port)
+        self.metrics.exporter_up.set(1)
+
+        self.logger.info(f"Prometheus metrics: http://0.0.0.0:{self.config.metrics_port}/metrics")
+        self.logger.info(f"Health check: http://0.0.0.0:{self.config.health_port}/health")
+        self.logger.info("Waiting for FIBRE events...")
+
+        # Poll for events
+        self._running = True
+        try:
+            while self._running:
+                self.bpf.perf_buffer_poll(timeout=1000)
+        except KeyboardInterrupt:
+            pass
+        finally:
+            self.metrics.exporter_up.set(0)
+            self.logger.info("Shutting down...")
+
+
+# ============================================================================
+# CLI
+# ============================================================================
+
+
+def parse_args() -> argparse.Namespace:
+    """Parse command line arguments."""
+    parser = argparse.ArgumentParser(
+        description="FIBRE USDT Metrics Exporter for Prometheus",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Environment variables:
+  FIBRE_BITCOIND_PATH   Path to bitcoind binary
+  FIBRE_PID             PID of running bitcoind
+  FIBRE_NODE_NAME       Node name label
+  FIBRE_METRICS_PORT    Prometheus metrics port
+  FIBRE_HEALTH_PORT     Health check port
+  FIBRE_VERBOSE         Enable verbose logging (true/false)
+  FIBRE_LOG_LEVEL       Log level (DEBUG, INFO, WARNING, ERROR)
+
+Examples:
+  # Run with command line arguments
+  %(prog)s --bitcoind /usr/local/bin/bitcoind --node-name mynode
+
+  # Run with config file
+  %(prog)s --config /etc/fibre-exporter/config.yaml
+
+  # Run with environment variables
+  FIBRE_BITCOIND_PATH=/usr/local/bin/bitcoind %(prog)s
+""",
+    )
+
+    parser.add_argument(
+        "--bitcoind", "-b",
+        help="Path to bitcoind binary",
+    )
+    parser.add_argument(
+        "--pid", "-p",
+        type=int,
+        help="PID of running bitcoind (optional, auto-detected)",
+    )
+    parser.add_argument(
+        "--node-name", "-n",
+        default="localhost",
+        help="Node name label (default: localhost)",
+    )
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=9435,
+        help="Prometheus metrics port (default: 9435)",
+    )
+    parser.add_argument(
+        "--health-port",
+        type=int,
+        default=9436,
+        help="Health check port (default: 9436)",
+    )
+    parser.add_argument(
+        "--config", "-c",
+        type=Path,
+        help="Path to YAML config file",
+    )
+    parser.add_argument(
+        "--verbose", "-v",
+        action="store_true",
+        help="Enable verbose logging of individual events",
+    )
+    parser.add_argument(
+        "--log-level",
+        default="INFO",
+        choices=["DEBUG", "INFO", "WARNING", "ERROR"],
+        help="Log level (default: INFO)",
+    )
+    parser.add_argument(
+        "--version",
+        action="version",
+        version=f"%(prog)s {__version__}",
+    )
+
+    return parser.parse_args()
+
+
+def main() -> None:
+    """Main entry point."""
+    args = parse_args()
+
+    # Build configuration from multiple sources (config file -> env vars -> CLI args)
+    if args.config and args.config.exists():
+        config = ExporterConfig.from_yaml(args.config)
+        config = ExporterConfig.from_env(config)
+    else:
+        # Start with CLI defaults, then override with env vars
+        config = ExporterConfig.from_args(args)
+        config = ExporterConfig.from_env(config)
+
+    # CLI args override everything
+    if args.bitcoind:
+        config.bitcoind_path = args.bitcoind
+    if args.pid:
+        config.pid = args.pid
+    if args.node_name != "localhost":
+        config.node_name = args.node_name
+    if args.port != 9435:
+        config.metrics_port = args.port
+    if args.health_port != 9436:
+        config.health_port = args.health_port
+    if args.verbose:
+        config.verbose = args.verbose
+    if args.log_level != "INFO":
+        config.log_level = args.log_level
+
+    # Validate required config
+    if not config.bitcoind_path:
+        print("Error: bitcoind path is required", file=sys.stderr)
+        print("Provide via --bitcoind, config file, or FIBRE_BITCOIND_PATH env var", file=sys.stderr)
         sys.exit(1)
 
-    EXPORTER_PROBES_ATTACHED.set(attached_count)
-    print(f"\n  {attached_count}/{len(probes)} probes attached successfully")
-    
-    # Load BPF program
-    global bpf
-    bpf = BPF(text=BPF_PROGRAM, usdt_contexts=[usdt])
-    
-    # Set up event callback
-    def _handle_event(cpu, data, size):
-        handle_event(cpu, data, size, args.node_name)
-    
-    bpf["events"].open_perf_buffer(_handle_event)
+    # Run exporter
+    exporter = FibreExporter(config)
+    exporter.run()
 
-    # Start Prometheus HTTP server
-    start_http_server(args.port)
-
-    # Start health check server
-    start_health_server(args.health_port)
-
-    # Mark exporter as up
-    EXPORTER_UP.set(1)
-
-    print(f"\nPrometheus metrics available at http://0.0.0.0:{args.port}/metrics")
-    print(f"Health check available at http://0.0.0.0:{args.health_port}/health")
-    print("Waiting for FIBRE events...\n")
-    
-    # Poll for events
-    try:
-        while True:
-            bpf.perf_buffer_poll(timeout=1000)
-    except KeyboardInterrupt:
-        EXPORTER_UP.set(0)
-        print("\nShutting down...")
 
 if __name__ == "__main__":
     main()
