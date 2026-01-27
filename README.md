@@ -31,11 +31,24 @@ sudo .venv/bin/python3 fibre_exporter.py --bitcoind <bitcoind_path> --pid $(pgre
   - --port: Prometheus metrics port (default: 9435)
 
 ### Run Grafana / Prometheus
+
+First, configure environment variables:
 ```bash
 cd docker
+cp .env.example .env
+# Edit .env and set GRAFANA_ADMIN_PASSWORD
+```
+
+Required environment variables:
+- `GRAFANA_ADMIN_PASSWORD`: Grafana admin password (required)
+- `GRAFANA_ADMIN_USER`: Grafana admin username (default: admin)
+- `BITCOIN_DATA_DIR`: Path to bitcoin data directory (default: /home/node/.bitcoin)
+
+Then start the stack:
+```bash
 docker compose up -d
 ```
 
   Access:
-  - Grafana: http://localhost:3000 (user: admin, pass: fibre123)
+  - Grafana: http://localhost:3000
   - Prometheus: http://localhost:9090

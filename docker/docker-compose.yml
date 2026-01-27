@@ -38,7 +38,7 @@ services:
     restart: unless-stopped
     volumes:
       - ./promtail/promtail.yml:/etc/promtail/promtail.yml:ro
-      - /home/node/.bitcoin:/var/log/bitcoin:ro
+      - ${BITCOIN_DATA_DIR:-/home/node/.bitcoin}:/var/log/bitcoin:ro
     command: -config.file=/etc/promtail/promtail.yml
     depends_on:
       - loki
@@ -52,8 +52,8 @@ services:
     ports:
       - "3000:3000"
     environment:
-      - GF_SECURITY_ADMIN_USER=admin
-      - GF_SECURITY_ADMIN_PASSWORD=fibre123
+      - GF_SECURITY_ADMIN_USER=${GRAFANA_ADMIN_USER:-admin}
+      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_ADMIN_PASSWORD:?GRAFANA_ADMIN_PASSWORD must be set}
       - GF_USERS_ALLOW_SIGN_UP=false
     volumes:
       - grafana_data:/var/lib/grafana

@@ -227,30 +227,32 @@ def main():
     
     # Set up USDT probes
     usdt = USDT(path=args.bitcoind, pid=args.pid)
-    
-    try:
-        usdt.enable_probe(probe="block_reconstructed", fn_name="trace_block_reconstructed")
-        print("  ✓ Attached: udp:block_reconstructed")
-    except Exception as e:
-        print(f"  ✗ Failed to attach block_reconstructed: {e}")
-    
-    try:
-        usdt.enable_probe(probe="block_send_start", fn_name="trace_block_send_start")
-        print("  ✓ Attached: udp:block_send_start")
-    except Exception as e:
-        print(f"  ✗ Failed to attach block_send_start: {e}")
-    
-    try:
-        usdt.enable_probe(probe="block_race_winner", fn_name="trace_race_winner")
-        print("  ✓ Attached: udp:block_race_winner")
-    except Exception as e:
-        print(f"  ✗ Failed to attach block_race_winner: {e}")
-    
-    try:
-        usdt.enable_probe(probe="block_race_time", fn_name="trace_race_time")
-        print("  ✓ Attached: udp:block_race_time")
-    except Exception as e:
-        print(f"  ✗ Failed to attach block_race_time: {e}")
+
+    probes = [
+        ("block_reconstructed", "trace_block_reconstructed"),
+        ("block_send_start", "trace_block_send_start"),
+        ("block_race_winner", "trace_race_winner"),
+        ("block_race_time", "trace_race_time"),
+    ]
+
+    attached_count = 0
+    for probe_name, fn_name in probes:
+        try:
+            usdt.enable_probe(probe=probe_name, fn_name=fn_name)
+            print(f"  ✓ Attached: udp:{probe_name}")
+            attached_count += 1
+        except Exception as e:
+            print(f"  ✗ Failed to attach {probe_name}: {e}")
+
+    if attached_count == 0:
+        print("\nERROR: No USDT probes could be attached.")
+        print("Possible causes:")
+        print("  - bitcoind was not compiled with USDT tracepoint support")
+        print("  - The specified PID is not a bitcoind process")
+        print("  - Insufficient permissions (try running with sudo)")
+        sys.exit(1)
+
+    print(f"\n  {attached_count}/{len(probes)} probes attached successfully")
     
     # Load BPF program
     global bpf
