@@ -56,7 +56,7 @@
         "textMode": "auto"
       },
       "targets": [
-        { "expr": "fibre_blocks_reconstructed_total{node=~\"$node\"}", "legendFormat": "{{node}}" }
+        { "expr": "sum(increase(fibre_blocks_reconstructed_total{node=~\"$node\"}[$__range]))", "legendFormat": "{{node}}" }
       ],
       "title": "📦 Blocks Reconstructed",
       "type": "stat"
@@ -87,7 +87,7 @@
         "textMode": "auto"
       },
       "targets": [
-        { "expr": "fibre_blocks_sent_total{node=~\"$node\"}", "legendFormat": "{{node}}" }
+        { "expr": "sum(increase(fibre_blocks_sent_total{node=~\"$node\"}[$__range]))", "legendFormat": "{{node}}" }
       ],
       "title": "📤 Blocks Sent",
       "type": "stat"
@@ -122,9 +122,9 @@
         "textMode": "auto"
       },
       "targets": [
-        { 
-          "expr": "sum(fibre_block_race_wins_total{mechanism=\"fibre_udp\",node=~\"$node\"}) / (sum(fibre_block_race_wins_total{mechanism=\"fibre_udp\",node=~\"$node\"}) + sum(fibre_block_race_wins_total{mechanism=\"bip152_cmpct\",node=~\"$node\"}))", 
-          "legendFormat": "Win Rate" 
+        {
+          "expr": "sum(increase(fibre_block_race_wins_total{mechanism=\"fibre_udp\",node=~\"$node\"}[$__range])) / (sum(increase(fibre_block_race_wins_total{mechanism=\"fibre_udp\",node=~\"$node\"}[$__range])) + sum(increase(fibre_block_race_wins_total{mechanism=\"bip152_cmpct\",node=~\"$node\"}[$__range])))",
+          "legendFormat": "Win Rate"
         }
       ],
       "title": "🏆 FIBRE Win Rate",
@@ -187,7 +187,7 @@
         "textMode": "auto"
       },
       "targets": [
-        { "expr": "sum(fibre_block_race_wins_total{mechanism=\"fibre_udp\",node=~\"$node\"})", "legendFormat": "UDP Wins" }
+        { "expr": "sum(increase(fibre_block_race_wins_total{mechanism=\"fibre_udp\",node=~\"$node\"}[$__range]))", "legendFormat": "UDP Wins" }
       ],
       "title": "🟢 UDP Wins",
       "type": "stat"
@@ -218,7 +218,7 @@
         "textMode": "auto"
       },
       "targets": [
-        { "expr": "sum(fibre_block_race_wins_total{mechanism=\"bip152_cmpct\",node=~\"$node\"})", "legendFormat": "Compact Wins" }
+        { "expr": "sum(increase(fibre_block_race_wins_total{mechanism=\"bip152_cmpct\",node=~\"$node\"}[$__range]))", "legendFormat": "Compact Wins" }
       ],
       "title": "🟠 Compact Wins",
       "type": "stat"
@@ -419,7 +419,7 @@
         "tooltip": { "mode": "single", "sort": "none" }
       },
       "targets": [
-        { "expr": "sum(fibre_block_race_wins_total{node=~\"$node\"}) by (mechanism)", "legendFormat": "{{mechanism}}" }
+        { "expr": "sum(increase(fibre_block_race_wins_total{node=~\"$node\"}[$__range])) by (mechanism)", "legendFormat": "{{mechanism}}" }
       ],
       "title": "🥧 Total Wins by Mechanism",
       "type": "piechart"
