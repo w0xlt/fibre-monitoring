@@ -71,6 +71,8 @@ sudo .venv/bin/python3 fibre_exporter.py \
 | `--config`, `-c` | No | - | Path to YAML config file |
 | `--verbose`, `-v` | No | false | Log individual events |
 | `--log-level` | No | INFO | Log level (DEBUG, INFO, WARNING, ERROR) |
+| `--metrics-auth-username` | No | - | Basic auth username for /metrics endpoint |
+| `--metrics-auth-password` | No | - | Basic auth password for /metrics endpoint |
 | `--version` | No | - | Show version and exit |
 
 *Required unless provided via config file or environment variable.
@@ -93,6 +95,10 @@ metrics_port: 9435
 health_port: 9436
 verbose: false
 log_level: INFO
+
+# Optional: Enable basic auth for /metrics endpoint
+metrics_auth_username: prometheus
+metrics_auth_password: changeme
 ```
 
 ### Environment Variables
@@ -108,6 +114,8 @@ All settings can also be configured via environment variables:
 | `FIBRE_HEALTH_PORT` | Health check port |
 | `FIBRE_VERBOSE` | Enable verbose logging (true/false) |
 | `FIBRE_LOG_LEVEL` | Log level (DEBUG, INFO, WARNING, ERROR) |
+| `FIBRE_METRICS_AUTH_USERNAME` | Basic auth username for /metrics endpoint |
+| `FIBRE_METRICS_AUTH_PASSWORD` | Basic auth password for /metrics endpoint |
 
 Configuration priority (highest to lowest):
 1. Command-line arguments
@@ -139,10 +147,13 @@ With `--verbose` mode, individual events are also logged:
 
 Test endpoints:
 ```bash
-# Metrics endpoint
+# Metrics endpoint (without auth)
 curl http://localhost:9435/metrics
 
-# Health check endpoint
+# Metrics endpoint (with basic auth enabled)
+curl -u prometheus:yourpassword http://localhost:9435/metrics
+
+# Health check endpoint (no auth required)
 curl http://localhost:9436/health
 ```
 
@@ -195,6 +206,10 @@ To monitor multiple FIBRE nodes, edit `docker/prometheus/prometheus.yml`:
 scrape_configs:
   - job_name: 'fibre'
     scrape_interval: 10s
+    # If exporters have basic auth enabled
+    basic_auth:
+      username: 'prometheus'
+      password: 'yourpassword'
     static_configs:
       - targets: ['host.docker.internal:9435']
         labels:
@@ -211,6 +226,37 @@ Then reload Prometheus:
 ```bash
 docker compose restart prometheus
 ```
+
+## Securing the Metrics Endpoint
+
+To prevent unauthorized access to your metrics, enable HTTP Basic Authentication on the exporter:
+
+```bash
+# Via environment variables
+export FIBRE_METRICS_AUTH_USERNAME=prometheus
+export FIBRE_METRICS_AUTH_PASSWORD=your_secure_password
+sudo -E .venv/bin/python3 fibre_exporter.py --bitcoind /path/to/bitcoind
+
+# Or via CLI arguments
+sudo .venv/bin/python3 fibre_exporter.py \
+  --bitcoind /path/to/bitcoind \
+  --metrics-auth-username prometheus \
+  --metrics-auth-password your_secure_password
+```
+
+Then configure Prometheus to authenticate when scraping (`docker/prometheus/prometheus.yml`):
+
+```yaml
+scrape_configs:
+  - job_name: 'fibre'
+    basic_auth:
+      username: 'prometheus'
+      password: 'your_secure_password'
+    static_configs:
+      - targets: ['host.docker.internal:9435']
+```
+
+**Note:** Both username and password must be set to enable authentication. The health check endpoint (`/health`) does not require authentication.
 
 ## Managing the Stack
 
