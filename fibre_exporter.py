@@ -11,6 +11,7 @@ import base64
 import hmac
 import logging
 import os
+import subprocess
 import sys
 import threading
 import time
@@ -132,6 +133,69 @@ def setup_logging(level: str = "INFO") -> logging.Logger:
     logger.addHandler(handler)
 
     return logger
+
+
+# ============================================================================
+# PID Detection
+# ============================================================================
+
+
+def find_bitcoind_pid(bitcoind_path: str) -> Optional[int]:
+    """Find the PID of a running bitcoind process.
+
+    Tries multiple methods to find the PID:
+    1. pgrep with the full path
+    2. pgrep with just the binary name
+    3. pidof with the binary name
+
+    Returns the PID if found, None otherwise.
+    """
+    binary_name = os.path.basename(bitcoind_path)
+
+    # Try pgrep with full path first (most specific)
+    try:
+        result = subprocess.run(
+            ["pgrep", "-f", bitcoind_path],
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            pids = result.stdout.strip().split('\n')
+            if len(pids) == 1:
+                return int(pids[0])
+            # Multiple PIDs found, try to be more specific
+    except Exception:
+        pass
+
+    # Try pgrep with binary name
+    try:
+        result = subprocess.run(
+            ["pgrep", "-x", binary_name],
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            pids = result.stdout.strip().split('\n')
+            if len(pids) == 1:
+                return int(pids[0])
+    except Exception:
+        pass
+
+    # Try pidof as fallback
+    try:
+        result = subprocess.run(
+            ["pidof", binary_name],
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            pids = result.stdout.strip().split()
+            if len(pids) == 1:
+                return int(pids[0])
+    except Exception:
+        pass
+
+    return None
 
 
 # ============================================================================
@@ -600,6 +664,18 @@ class FibreExporter:
         self.logger.info(f"FIBRE USDT Metrics Exporter v{__version__}")
         self.logger.info(f"Configuration: bitcoind={self.config.bitcoind_path} "
                         f"node={self.config.node_name} port={self.config.metrics_port}")
+
+        # Auto-detect PID if not provided
+        if self.config.pid is None:
+            self.logger.info("PID not specified, attempting auto-detection...")
+            detected_pid = find_bitcoind_pid(self.config.bitcoind_path)
+            if detected_pid:
+                self.config.pid = detected_pid
+                self.logger.info(f"Auto-detected bitcoind PID: {detected_pid}")
+            else:
+                self.logger.error("Could not auto-detect bitcoind PID")
+                self.logger.error("Please specify --pid manually or ensure bitcoind is running")
+                sys.exit(1)
 
         # Set exporter info
         self.metrics.exporter_info.info({
