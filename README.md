@@ -36,7 +36,7 @@ Loki (:3100) ← Promtail (bitcoin debug.log)
 
 ```bash
 sudo apt update
-sudo apt install bpfcc-tools python3-bpfcc python3-venv
+sudo apt install bpfcc-tools python3-bpfcc python3-venv bpftrace
 ```
 
 ### 2. Set up Python environment
