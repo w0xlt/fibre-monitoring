@@ -7,6 +7,8 @@ Captures block relay performance from bitcoind USDT tracepoints
 from __future__ import annotations
 
 import argparse
+import base64
+import hmac
 import logging
 import os
 import sys
@@ -17,8 +19,10 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from typing import Any, Optional
 
+from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
+
 from bcc import BPF, USDT
-from prometheus_client import Counter, Gauge, Histogram, Info, start_http_server
+from prometheus_client import Counter, Gauge, Histogram, Info, start_http_server, REGISTRY
 
 # ============================================================================
 # Version
@@ -42,6 +46,9 @@ class ExporterConfig:
     health_port: int = 9436
     verbose: bool = False
     log_level: str = "INFO"
+    # Basic auth for metrics endpoint
+    metrics_auth_username: Optional[str] = None
+    metrics_auth_password: Optional[str] = None
 
     @classmethod
     def from_args(cls, args: argparse.Namespace) -> ExporterConfig:
@@ -54,6 +61,8 @@ class ExporterConfig:
             health_port=args.health_port,
             verbose=args.verbose,
             log_level=args.log_level,
+            metrics_auth_username=getattr(args, 'metrics_auth_username', None),
+            metrics_auth_password=getattr(args, 'metrics_auth_password', None),
         )
 
     @classmethod
@@ -72,6 +81,8 @@ class ExporterConfig:
             health_port=data.get("health_port", 9436),
             verbose=data.get("verbose", False),
             log_level=data.get("log_level", "INFO"),
+            metrics_auth_username=data.get("metrics_auth_username"),
+            metrics_auth_password=data.get("metrics_auth_password"),
         )
 
     @classmethod
@@ -88,7 +99,13 @@ class ExporterConfig:
             health_port=int(os.environ.get("FIBRE_HEALTH_PORT", base_config.health_port)),
             verbose=os.environ.get("FIBRE_VERBOSE", str(base_config.verbose)).lower() == "true",
             log_level=os.environ.get("FIBRE_LOG_LEVEL", base_config.log_level),
+            metrics_auth_username=os.environ.get("FIBRE_METRICS_AUTH_USERNAME", base_config.metrics_auth_username),
+            metrics_auth_password=os.environ.get("FIBRE_METRICS_AUTH_PASSWORD", base_config.metrics_auth_password),
         )
+
+    def has_metrics_auth(self) -> bool:
+        """Check if metrics authentication is configured."""
+        return bool(self.metrics_auth_username and self.metrics_auth_password)
 
 
 # ============================================================================
@@ -341,6 +358,98 @@ def start_health_server(port: int) -> HTTPServer:
 
 
 # ============================================================================
+# Metrics Server with Basic Auth
+# ============================================================================
+
+
+class MetricsHandler(BaseHTTPRequestHandler):
+    """HTTP handler for Prometheus metrics with optional basic auth."""
+
+    # These are set by the factory function
+    auth_username: Optional[str] = None
+    auth_password: Optional[str] = None
+
+    def _check_auth(self) -> bool:
+        """Check basic authentication. Returns True if auth passes or is not configured."""
+        if not self.auth_username or not self.auth_password:
+            return True
+
+        auth_header = self.headers.get("Authorization")
+        if not auth_header:
+            return False
+
+        try:
+            if not auth_header.startswith("Basic "):
+                return False
+
+            encoded_credentials = auth_header[6:]
+            decoded = base64.b64decode(encoded_credentials).decode("utf-8")
+            username, password = decoded.split(":", 1)
+
+            # Use constant-time comparison to prevent timing attacks
+            username_match = hmac.compare_digest(username, self.auth_username)
+            password_match = hmac.compare_digest(password, self.auth_password)
+
+            return username_match and password_match
+        except Exception:
+            return False
+
+    def _send_auth_required(self) -> None:
+        """Send 401 Unauthorized response."""
+        self.send_response(401)
+        self.send_header("WWW-Authenticate", 'Basic realm="FIBRE Metrics"')
+        self.send_header("Content-Type", "text/plain")
+        self.end_headers()
+        self.wfile.write(b"Unauthorized")
+
+    def do_GET(self) -> None:
+        if self.path == "/metrics":
+            if not self._check_auth():
+                self._send_auth_required()
+                return
+
+            self.send_response(200)
+            self.send_header("Content-Type", CONTENT_TYPE_LATEST)
+            self.end_headers()
+            self.wfile.write(generate_latest(REGISTRY))
+        else:
+            self.send_response(404)
+            self.send_header("Content-Type", "text/plain")
+            self.end_headers()
+            self.wfile.write(b"Not Found")
+
+    def log_message(self, format: str, *args: Any) -> None:
+        # Suppress default logging
+        pass
+
+
+def create_metrics_handler(
+    username: Optional[str] = None,
+    password: Optional[str] = None,
+) -> type[MetricsHandler]:
+    """Create a MetricsHandler class with auth credentials."""
+
+    class ConfiguredMetricsHandler(MetricsHandler):
+        auth_username = username
+        auth_password = password
+
+    return ConfiguredMetricsHandler
+
+
+def start_metrics_server(
+    port: int,
+    username: Optional[str] = None,
+    password: Optional[str] = None,
+) -> HTTPServer:
+    """Start metrics server with optional basic auth in a background thread."""
+    handler_class = create_metrics_handler(username, password)
+    server = HTTPServer(("0.0.0.0", port), handler_class)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    return server
+
+
+# ============================================================================
 # FIBRE Exporter
 # ============================================================================
 
@@ -516,7 +625,17 @@ class FibreExporter:
         self.logger.info(f"Attached {attached_count}/4 probes successfully")
 
         # Start servers
-        start_http_server(self.config.metrics_port)
+        if self.config.has_metrics_auth():
+            start_metrics_server(
+                self.config.metrics_port,
+                self.config.metrics_auth_username,
+                self.config.metrics_auth_password,
+            )
+            self.logger.info("Metrics endpoint basic auth: enabled")
+        else:
+            start_http_server(self.config.metrics_port)
+            self.logger.info("Metrics endpoint basic auth: disabled")
+
         start_health_server(self.config.health_port)
         self.metrics.exporter_up.set(1)
 
@@ -548,13 +667,15 @@ def parse_args() -> argparse.Namespace:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Environment variables:
-  FIBRE_BITCOIND_PATH   Path to bitcoind binary
-  FIBRE_PID             PID of running bitcoind
-  FIBRE_NODE_NAME       Node name label
-  FIBRE_METRICS_PORT    Prometheus metrics port
-  FIBRE_HEALTH_PORT     Health check port
-  FIBRE_VERBOSE         Enable verbose logging (true/false)
-  FIBRE_LOG_LEVEL       Log level (DEBUG, INFO, WARNING, ERROR)
+  FIBRE_BITCOIND_PATH          Path to bitcoind binary
+  FIBRE_PID                    PID of running bitcoind
+  FIBRE_NODE_NAME              Node name label
+  FIBRE_METRICS_PORT           Prometheus metrics port
+  FIBRE_HEALTH_PORT            Health check port
+  FIBRE_VERBOSE                Enable verbose logging (true/false)
+  FIBRE_LOG_LEVEL              Log level (DEBUG, INFO, WARNING, ERROR)
+  FIBRE_METRICS_AUTH_USERNAME  Basic auth username for /metrics endpoint
+  FIBRE_METRICS_AUTH_PASSWORD  Basic auth password for /metrics endpoint
 
 Examples:
   # Run with command line arguments
@@ -565,6 +686,9 @@ Examples:
 
   # Run with environment variables
   FIBRE_BITCOIND_PATH=/usr/local/bin/bitcoind %(prog)s
+
+  # Run with basic auth enabled
+  %(prog)s --bitcoind /usr/local/bin/bitcoind --metrics-auth-username prometheus --metrics-auth-password secret
 """,
     )
 
@@ -611,6 +735,14 @@ Examples:
         help="Log level (default: INFO)",
     )
     parser.add_argument(
+        "--metrics-auth-username",
+        help="Basic auth username for /metrics endpoint",
+    )
+    parser.add_argument(
+        "--metrics-auth-password",
+        help="Basic auth password for /metrics endpoint",
+    )
+    parser.add_argument(
         "--version",
         action="version",
         version=f"%(prog)s {__version__}",
@@ -647,6 +779,10 @@ def main() -> None:
         config.verbose = args.verbose
     if args.log_level != "INFO":
         config.log_level = args.log_level
+    if args.metrics_auth_username:
+        config.metrics_auth_username = args.metrics_auth_username
+    if args.metrics_auth_password:
+        config.metrics_auth_password = args.metrics_auth_password
 
     # Validate required config
     if not config.bitcoind_path:

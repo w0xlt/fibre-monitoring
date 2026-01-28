@@ -12,11 +12,16 @@ scrape_configs:
   # host.docker.internal resolves to the host's IP from within Docker
   - job_name: 'fibre'
     scrape_interval: 10s
+    # Basic auth credentials - set FIBRE_METRICS_AUTH_USERNAME and FIBRE_METRICS_AUTH_PASSWORD
+    # on the exporter to enable authentication
+    basic_auth:
+      username: 'prometheus'
+      password: 'changeme'
     static_configs:
       - targets: ['host.docker.internal:9435']
         labels:
           node: 'mynode'
-      - targets: ['<IP>:9435']
+      - targets: ['141.125.106.97:9435']
         labels:
           node: 'london_node'
 
