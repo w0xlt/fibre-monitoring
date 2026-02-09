@@ -47,6 +47,7 @@ class ExporterConfig:
     health_port: int = 9436
     verbose: bool = False
     log_level: str = "INFO"
+    log_file: Optional[str] = None
     # Basic auth for metrics endpoint
     metrics_auth_username: Optional[str] = None
     metrics_auth_password: Optional[str] = None
@@ -62,6 +63,7 @@ class ExporterConfig:
             health_port=args.health_port,
             verbose=args.verbose,
             log_level=args.log_level,
+            log_file=getattr(args, 'log_file', None),
             metrics_auth_username=getattr(args, 'metrics_auth_username', None),
             metrics_auth_password=getattr(args, 'metrics_auth_password', None),
         )
@@ -82,6 +84,7 @@ class ExporterConfig:
             health_port=data.get("health_port", 9436),
             verbose=data.get("verbose", False),
             log_level=data.get("log_level", "INFO"),
+            log_file=data.get("log_file"),
             metrics_auth_username=data.get("metrics_auth_username"),
             metrics_auth_password=data.get("metrics_auth_password"),
         )
@@ -100,6 +103,7 @@ class ExporterConfig:
             health_port=int(os.environ.get("FIBRE_HEALTH_PORT", base_config.health_port)),
             verbose=os.environ.get("FIBRE_VERBOSE", str(base_config.verbose)).lower() == "true",
             log_level=os.environ.get("FIBRE_LOG_LEVEL", base_config.log_level),
+            log_file=os.environ.get("FIBRE_LOG_FILE", base_config.log_file),
             metrics_auth_username=os.environ.get("FIBRE_METRICS_AUTH_USERNAME", base_config.metrics_auth_username),
             metrics_auth_password=os.environ.get("FIBRE_METRICS_AUTH_PASSWORD", base_config.metrics_auth_password),
         )
@@ -114,23 +118,28 @@ class ExporterConfig:
 # ============================================================================
 
 
-def setup_logging(level: str = "INFO") -> logging.Logger:
+def setup_logging(level: str = "INFO", log_file: Optional[str] = None) -> logging.Logger:
     """Configure structured logging."""
     log_level = getattr(logging, level.upper(), logging.INFO)
 
-    # Create formatter
     formatter = logging.Formatter(
         fmt="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
     )
 
-    # Configure root logger
-    handler = logging.StreamHandler(sys.stdout)
-    handler.setFormatter(formatter)
-
     logger = logging.getLogger("fibre_exporter")
     logger.setLevel(log_level)
-    logger.addHandler(handler)
+
+    # Always log to stdout
+    stdout_handler = logging.StreamHandler(sys.stdout)
+    stdout_handler.setFormatter(formatter)
+    logger.addHandler(stdout_handler)
+
+    # Optionally also log to file (line-buffered for real-time tailing)
+    if log_file:
+        file_handler = logging.FileHandler(log_file)
+        file_handler.setFormatter(formatter)
+        logger.addHandler(file_handler)
 
     return logger
 
@@ -566,7 +575,7 @@ class FibreExporter:
 
     def __init__(self, config: ExporterConfig) -> None:
         self.config = config
-        self.logger = setup_logging(config.log_level)
+        self.logger = setup_logging(config.log_level, config.log_file)
         self.metrics = FibreMetrics()
         self.bpf: Optional[BPF] = None
         self._running = False
@@ -894,6 +903,10 @@ Examples:
         help="Log level (default: INFO)",
     )
     parser.add_argument(
+        "--log-file",
+        help="Path to log file (logs to both stdout and file)",
+    )
+    parser.add_argument(
         "--metrics-auth-username",
         help="Basic auth username for /metrics endpoint",
     )
@@ -938,6 +951,8 @@ def main() -> None:
         config.verbose = args.verbose
     if args.log_level != "INFO":
         config.log_level = args.log_level
+    if getattr(args, 'log_file', None):
+        config.log_file = args.log_file
     if args.metrics_auth_username:
         config.metrics_auth_username = args.metrics_auth_username
     if args.metrics_auth_password:
