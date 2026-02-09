@@ -29,7 +29,7 @@ from prometheus_client import Counter, Gauge, Histogram, Info, start_http_server
 # Version
 # ============================================================================
 
-__version__ = "1.1.0"
+__version__ = "1.2.0"
 
 # ============================================================================
 # Configuration
@@ -278,6 +278,27 @@ class FibreMetrics:
         ["node"],
     ))
 
+    # Block connection metrics (fires for ALL blocks, regardless of delivery path)
+    blocks_connected: Counter = field(default_factory=lambda: Counter(
+        "bitcoin_blocks_connected_total",
+        "Total blocks connected to the chain (all delivery paths)",
+        ["node"],
+    ))
+
+    block_connection_time: Histogram = field(default_factory=lambda: Histogram(
+        "bitcoin_block_connection_duration_seconds",
+        "Time to connect a block to the chain",
+        ["node"],
+        buckets=[0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0],
+    ))
+
+    block_tx_count: Histogram = field(default_factory=lambda: Histogram(
+        "bitcoin_block_tx_count",
+        "Number of transactions per connected block",
+        ["node"],
+        buckets=[1, 10, 50, 100, 250, 500, 1000, 2000, 3000, 5000, 10000],
+    ))
+
     # Exporter self-monitoring metrics
     exporter_up: Gauge = field(default_factory=lambda: Gauge(
         "fibre_exporter_up",
@@ -326,6 +347,7 @@ enum event_type {
     EVENT_BLOCK_SEND_START = 2,
     EVENT_RACE_WINNER = 3,
     EVENT_RACE_TIME = 4,
+    EVENT_BLOCK_CONNECTED = 10,
 };
 
 struct event_t {
@@ -382,6 +404,19 @@ int trace_race_time(struct pt_regs *ctx) {
     bpf_usdt_readarg(2, ctx, &event.height);
     bpf_usdt_readarg(3, ctx, &event.udp_ns);
     bpf_usdt_readarg(5, ctx, &event.cmpct_ns);
+
+    events.perf_submit(ctx, &event, sizeof(event));
+    return 0;
+}
+
+int trace_block_connected(struct pt_regs *ctx) {
+    struct event_t event = {};
+    event.type = EVENT_BLOCK_CONNECTED;
+
+    // Args: block_hash, height, tx_count, inputs, sigops, connection_time_ns
+    bpf_usdt_readarg(2, ctx, &event.height);
+    bpf_usdt_readarg(3, ctx, &event.udp_ns);        // reuse s64 for tx_count (8@)
+    bpf_usdt_readarg(6, ctx, &event.duration_us);    // reuse s64 for connection_time_ns (-8@)
 
     events.perf_submit(ctx, &event, sizeof(event));
     return 0;
@@ -522,6 +557,7 @@ EVENT_TYPE_NAMES: dict[int, str] = {
     2: "block_send_start",
     3: "race_winner",
     4: "race_time",
+    10: "block_connected",
 }
 
 
@@ -550,6 +586,8 @@ class FibreExporter:
                 self._handle_race_winner(event)
             elif event.type == 4:  # RACE_TIME
                 self._handle_race_time(event)
+            elif event.type == 10:  # BLOCK_CONNECTED
+                self._handle_block_connected(event)
 
         except Exception as e:
             self.metrics.exporter_errors_total.labels(error_type="event_processing").inc()
@@ -630,6 +668,29 @@ class FibreExporter:
                 else f"Race time: height={event.height}"
             )
 
+    def _handle_block_connected(self, event: Any) -> None:
+        """Handle block connected event (fires for every block)."""
+        node = self.config.node_name
+        connection_time_ns = event.duration_us  # reused s64 field holds connection_time_ns
+        tx_count = event.udp_ns  # reused s64 field holds tx_count
+
+        self.metrics.blocks_connected.labels(node=node).inc()
+        self.metrics.last_block_height.labels(node=node).set(event.height)
+
+        if connection_time_ns > 0:
+            connection_time_sec = connection_time_ns / 1_000_000_000.0
+            self.metrics.block_connection_time.labels(node=node).observe(connection_time_sec)
+
+        if tx_count > 0:
+            self.metrics.block_tx_count.labels(node=node).observe(tx_count)
+
+        if self.config.verbose:
+            conn_ms = connection_time_ns / 1_000_000.0 if connection_time_ns > 0 else 0
+            self.logger.info(
+                f"Block connected: height={event.height} "
+                f"tx_count={tx_count} connection_time={conn_ms:.1f}ms"
+            )
+
     def _attach_probes(self) -> int:
         """Attach USDT probes to bitcoind. Returns number of probes attached."""
         # Store as instance attr to prevent GC — USDT.__del__ calls bcc_usdt_close()
@@ -637,21 +698,26 @@ class FibreExporter:
         self._usdt = USDT(path=self.config.bitcoind_path, pid=self.config.pid)
         usdt = self._usdt
 
-        probes = [
-            ("block_reconstructed", "trace_block_reconstructed"),
-            ("block_send_start", "trace_block_send_start"),
-            ("block_race_winner", "trace_race_winner"),
-            ("block_race_time", "trace_race_time"),
+        # FIBRE-specific probes (udp provider) — only fire via compact block / FIBRE paths
+        fibre_probes = [
+            ("block_reconstructed", "trace_block_reconstructed", "udp"),
+            ("block_send_start", "trace_block_send_start", "udp"),
+            ("block_race_winner", "trace_race_winner", "udp"),
+            ("block_race_time", "trace_race_time", "udp"),
+        ]
+        # General block probe (validation provider) — fires for ALL blocks unconditionally
+        validation_probes = [
+            ("block_connected", "trace_block_connected", "validation"),
         ]
 
         attached_count = 0
-        for probe_name, fn_name in probes:
+        for probe_name, fn_name, provider in fibre_probes + validation_probes:
             try:
                 usdt.enable_probe(probe=probe_name, fn_name=fn_name)
-                self.logger.info(f"Attached probe: udp:{probe_name}")
+                self.logger.info(f"Attached probe: {provider}:{probe_name}")
                 attached_count += 1
             except Exception as e:
-                self.logger.warning(f"Failed to attach probe {probe_name}: {e}")
+                self.logger.warning(f"Failed to attach probe {provider}:{probe_name}: {e}")
 
         if attached_count == 0:
             return 0
@@ -715,7 +781,7 @@ class FibreExporter:
             sys.exit(1)
 
         self.metrics.exporter_probes_attached.set(attached_count)
-        self.logger.info(f"Attached {attached_count}/4 probes successfully")
+        self.logger.info(f"Attached {attached_count}/5 probes successfully")
 
         # Start servers
         if self.config.has_metrics_auth():
