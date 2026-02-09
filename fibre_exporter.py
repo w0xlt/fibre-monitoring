@@ -632,7 +632,10 @@ class FibreExporter:
 
     def _attach_probes(self) -> int:
         """Attach USDT probes to bitcoind. Returns number of probes attached."""
-        usdt = USDT(path=self.config.bitcoind_path, pid=self.config.pid)
+        # Store as instance attr to prevent GC — USDT.__del__ calls bcc_usdt_close()
+        # which detaches the uprobes if the object is garbage collected.
+        self._usdt = USDT(path=self.config.bitcoind_path, pid=self.config.pid)
+        usdt = self._usdt
 
         probes = [
             ("block_reconstructed", "trace_block_reconstructed"),
@@ -676,6 +679,20 @@ class FibreExporter:
                 self.logger.error("Could not auto-detect bitcoind PID")
                 self.logger.error("Please specify --pid manually or ensure bitcoind is running")
                 sys.exit(1)
+
+        # Verify binary path matches running process
+        try:
+            proc_exe = os.readlink(f"/proc/{self.config.pid}/exe")
+            if os.path.realpath(self.config.bitcoind_path) != os.path.realpath(proc_exe):
+                self.logger.warning(
+                    f"Binary path mismatch! --bitcoind={self.config.bitcoind_path} "
+                    f"but /proc/{self.config.pid}/exe -> {proc_exe}"
+                )
+                self.logger.warning("USDT probes may not fire if attached to the wrong binary")
+            else:
+                self.logger.info(f"Binary path verified: matches /proc/{self.config.pid}/exe")
+        except OSError as e:
+            self.logger.warning(f"Could not verify binary path: {e}")
 
         # Set exporter info
         self.metrics.exporter_info.info({
