@@ -258,7 +258,7 @@ class FibreMetrics:
     race_wins: Counter = field(default_factory=lambda: Counter(
         "fibre_block_race_wins_total",
         "Block race wins by mechanism",
-        ["node", "mechanism"],
+        ["node", "mechanism", "peer"],
     ))
 
     race_latency: Histogram = field(default_factory=lambda: Histogram(
@@ -368,6 +368,8 @@ struct event_t {
     s64 udp_ns;
     s64 cmpct_ns;
     char winner[24];
+    char peer[48];
+    char peer2[48];
 };
 
 int trace_block_reconstructed(struct pt_regs *ctx) {
@@ -401,6 +403,10 @@ int trace_race_winner(struct pt_regs *ctx) {
     bpf_usdt_readarg(3, ctx, &winner_ptr);
     bpf_probe_read_user_str(&event.winner, sizeof(event.winner), (void *)winner_ptr);
 
+    u64 peer_ptr;
+    bpf_usdt_readarg(4, ctx, &peer_ptr);
+    bpf_probe_read_user_str(&event.peer, sizeof(event.peer), (void *)peer_ptr);
+
     events.perf_submit(ctx, &event, sizeof(event));
     return 0;
 }
@@ -413,6 +419,12 @@ int trace_race_time(struct pt_regs *ctx) {
     bpf_usdt_readarg(2, ctx, &event.height);
     bpf_usdt_readarg(3, ctx, &event.udp_ns);
     bpf_usdt_readarg(5, ctx, &event.cmpct_ns);
+
+    u64 udp_peer_ptr, cmpct_peer_ptr;
+    bpf_usdt_readarg(4, ctx, &udp_peer_ptr);
+    bpf_probe_read_user_str(&event.peer, sizeof(event.peer), (void *)udp_peer_ptr);
+    bpf_usdt_readarg(6, ctx, &cmpct_peer_ptr);
+    bpf_probe_read_user_str(&event.peer2, sizeof(event.peer2), (void *)cmpct_peer_ptr);
 
     events.perf_submit(ctx, &event, sizeof(event));
     return 0;
@@ -630,6 +642,7 @@ class FibreExporter:
         """Handle race winner event."""
         node = self.config.node_name
         winner_str = event.winner.decode("utf-8", errors="ignore").rstrip("\x00")
+        peer_str = event.peer.decode("utf-8", errors="ignore").rstrip("\x00")
 
         if winner_str.startswith("F"):
             mechanism = "fibre_udp"
@@ -638,15 +651,19 @@ class FibreExporter:
         else:
             mechanism = "other"
 
-        self.metrics.race_wins.labels(node=node, mechanism=mechanism).inc()
+        self.metrics.race_wins.labels(node=node, mechanism=mechanism, peer=peer_str).inc()
         self.metrics.last_block_height.labels(node=node).set(event.height)
 
         if self.config.verbose:
-            self.logger.info(f"Race winner: height={event.height} winner={mechanism}")
+            self.logger.info(
+                f"Race winner: height={event.height} winner={mechanism} peer={peer_str}"
+            )
 
     def _handle_race_time(self, event: Any) -> None:
         """Handle race time event."""
         node = self.config.node_name
+        udp_peer = event.peer.decode("utf-8", errors="ignore").rstrip("\x00")
+        cmpct_peer = event.peer2.decode("utf-8", errors="ignore").rstrip("\x00")
         self.metrics.last_block_height.labels(node=node).set(event.height)
 
         udp_latency_sec = None
@@ -670,12 +687,17 @@ class FibreExporter:
                 self.metrics.race_margin.labels(node=node, winner="bip152_cmpct").observe(margin)
 
         if self.config.verbose:
-            self.logger.info(
-                f"Race time: height={event.height} "
-                f"udp={udp_latency_sec:.3f}s cmpct={cmpct_latency_sec:.3f}s"
-                if udp_latency_sec and cmpct_latency_sec
-                else f"Race time: height={event.height}"
-            )
+            if udp_latency_sec and cmpct_latency_sec:
+                self.logger.info(
+                    f"Race time: height={event.height} "
+                    f"udp={udp_latency_sec:.3f}s ({udp_peer}) "
+                    f"cmpct={cmpct_latency_sec:.3f}s ({cmpct_peer})"
+                )
+            else:
+                self.logger.info(
+                    f"Race time: height={event.height} "
+                    f"udp_peer={udp_peer} cmpct_peer={cmpct_peer}"
+                )
 
     def _handle_block_connected(self, event: Any) -> None:
         """Handle block connected event (fires for every block)."""
