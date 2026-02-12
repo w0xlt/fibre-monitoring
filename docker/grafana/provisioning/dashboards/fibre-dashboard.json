@@ -56,7 +56,7 @@
         "textMode": "auto"
       },
       "targets": [
-        { "expr": "round(sum(increase(fibre_blocks_reconstructed_total{node=~\"$node\"}[$__range])))", "legendFormat": "{{node}}" }
+        { "expr": "round(sum by (node) (increase(fibre_blocks_reconstructed_total{node=~\"$node\"}[$__range])))", "legendFormat": "{{node}}" }
       ],
       "title": "Blocks Reconstructed",
       "type": "stat"
@@ -87,7 +87,7 @@
         "textMode": "auto"
       },
       "targets": [
-        { "expr": "round(sum(increase(fibre_blocks_sent_total{node=~\"$node\"}[$__range])))", "legendFormat": "{{node}}" }
+        { "expr": "round(sum by (node) (increase(fibre_blocks_sent_total{node=~\"$node\"}[$__range])))", "legendFormat": "{{node}}" }
       ],
       "title": "Blocks Sent",
       "type": "stat"
