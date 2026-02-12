@@ -285,7 +285,8 @@
           {
             "matcher": { "id": "byName", "options": "Value" },
             "properties": [
-              { "id": "displayName", "value": "Deliveries" }
+              { "id": "displayName", "value": "Deliveries" },
+              { "id": "decimals", "value": 0 }
             ]
           }
         ]

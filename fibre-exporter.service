@@ -1,6 +1,6 @@
 [Unit]
 Description=FIBRE USDT Metrics Exporter
-Documentation=https://github.com/user/fibre-monitoring
+Documentation=https://github.com/w0xlt/fibre-monitoring
 After=network.target bitcoind.service
 Wants=bitcoind.service
 
