@@ -11,6 +11,7 @@ import base64
 import hmac
 import logging
 import os
+import ssl
 import subprocess
 import sys
 import threading
@@ -51,6 +52,9 @@ class ExporterConfig:
     # Basic auth for metrics endpoint
     metrics_auth_username: Optional[str] = None
     metrics_auth_password: Optional[str] = None
+    # TLS
+    tls_cert: Optional[str] = None
+    tls_key: Optional[str] = None
 
     @classmethod
     def from_args(cls, args: argparse.Namespace) -> ExporterConfig:
@@ -66,6 +70,8 @@ class ExporterConfig:
             log_file=getattr(args, 'log_file', None),
             metrics_auth_username=getattr(args, 'metrics_auth_username', None),
             metrics_auth_password=getattr(args, 'metrics_auth_password', None),
+            tls_cert=getattr(args, 'tls_cert', None),
+            tls_key=getattr(args, 'tls_key', None),
         )
 
     @classmethod
@@ -87,6 +93,8 @@ class ExporterConfig:
             log_file=data.get("log_file"),
             metrics_auth_username=data.get("metrics_auth_username"),
             metrics_auth_password=data.get("metrics_auth_password"),
+            tls_cert=data.get("tls_cert"),
+            tls_key=data.get("tls_key"),
         )
 
     @classmethod
@@ -106,11 +114,17 @@ class ExporterConfig:
             log_file=os.environ.get("FIBRE_LOG_FILE", base_config.log_file),
             metrics_auth_username=os.environ.get("FIBRE_METRICS_AUTH_USERNAME", base_config.metrics_auth_username),
             metrics_auth_password=os.environ.get("FIBRE_METRICS_AUTH_PASSWORD", base_config.metrics_auth_password),
+            tls_cert=os.environ.get("FIBRE_TLS_CERT", base_config.tls_cert),
+            tls_key=os.environ.get("FIBRE_TLS_KEY", base_config.tls_key),
         )
 
     def has_metrics_auth(self) -> bool:
         """Check if metrics authentication is configured."""
         return bool(self.metrics_auth_username and self.metrics_auth_password)
+
+    def has_tls(self) -> bool:
+        """Check if TLS is configured."""
+        return bool(self.tls_cert and self.tls_key)
 
 
 # ============================================================================
@@ -428,9 +442,11 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
         pass
 
 
-def start_health_server(port: int) -> HTTPServer:
+def start_health_server(port: int, ssl_ctx: Optional[ssl.SSLContext] = None) -> HTTPServer:
     """Start health check server in a background thread."""
     server = HTTPServer(("0.0.0.0", port), HealthCheckHandler)
+    if ssl_ctx:
+        server.socket = ssl_ctx.wrap_socket(server.socket, server_side=True)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     return server
@@ -519,10 +535,13 @@ def start_metrics_server(
     port: int,
     username: Optional[str] = None,
     password: Optional[str] = None,
+    ssl_ctx: Optional[ssl.SSLContext] = None,
 ) -> HTTPServer:
     """Start metrics server with optional basic auth in a background thread."""
     handler_class = create_metrics_handler(username, password)
     server = HTTPServer(("0.0.0.0", port), handler_class)
+    if ssl_ctx:
+        server.socket = ssl_ctx.wrap_socket(server.socket, server_side=True)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     return server
@@ -729,23 +748,35 @@ class FibreExporter:
         self.metrics.exporter_probes_attached.set(attached_count)
         self.logger.info(f"Attached {attached_count}/4 probes successfully")
 
+        # Build TLS context if configured
+        ssl_ctx = None
+        if self.config.has_tls():
+            ssl_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+            ssl_ctx.load_cert_chain(self.config.tls_cert, self.config.tls_key)
+            self.logger.info(f"TLS enabled: cert={self.config.tls_cert}")
+        else:
+            self.logger.info("TLS: disabled")
+
         # Start servers
-        if self.config.has_metrics_auth():
+        if self.config.has_metrics_auth() or ssl_ctx:
             start_metrics_server(
                 self.config.metrics_port,
                 self.config.metrics_auth_username,
                 self.config.metrics_auth_password,
+                ssl_ctx,
             )
-            self.logger.info("Metrics endpoint basic auth: enabled")
+            if self.config.has_metrics_auth():
+                self.logger.info("Metrics endpoint basic auth: enabled")
         else:
             start_http_server(self.config.metrics_port)
             self.logger.info("Metrics endpoint basic auth: disabled")
 
-        start_health_server(self.config.health_port)
+        start_health_server(self.config.health_port, ssl_ctx)
         self.metrics.exporter_up.set(1)
 
-        self.logger.info(f"Prometheus metrics: http://0.0.0.0:{self.config.metrics_port}/metrics")
-        self.logger.info(f"Health check: http://0.0.0.0:{self.config.health_port}/health")
+        scheme = "https" if ssl_ctx else "http"
+        self.logger.info(f"Prometheus metrics: {scheme}://0.0.0.0:{self.config.metrics_port}/metrics")
+        self.logger.info(f"Health check: {scheme}://0.0.0.0:{self.config.health_port}/health")
         self.logger.info("Waiting for FIBRE events...")
 
         # Poll for events
@@ -781,6 +812,8 @@ Environment variables:
   FIBRE_LOG_LEVEL              Log level (DEBUG, INFO, WARNING, ERROR)
   FIBRE_METRICS_AUTH_USERNAME  Basic auth username for /metrics endpoint
   FIBRE_METRICS_AUTH_PASSWORD  Basic auth password for /metrics endpoint
+  FIBRE_TLS_CERT               Path to TLS certificate file
+  FIBRE_TLS_KEY                Path to TLS private key file
 
 Examples:
   # Run with command line arguments
@@ -852,6 +885,14 @@ Examples:
         help="Basic auth password for /metrics endpoint",
     )
     parser.add_argument(
+        "--tls-cert",
+        help="Path to TLS certificate file (enables HTTPS)",
+    )
+    parser.add_argument(
+        "--tls-key",
+        help="Path to TLS private key file",
+    )
+    parser.add_argument(
         "--version",
         action="version",
         version=f"%(prog)s {__version__}",
@@ -894,11 +935,19 @@ def main() -> None:
         config.metrics_auth_username = args.metrics_auth_username
     if args.metrics_auth_password:
         config.metrics_auth_password = args.metrics_auth_password
+    if args.tls_cert:
+        config.tls_cert = args.tls_cert
+    if args.tls_key:
+        config.tls_key = args.tls_key
 
     # Validate required config
     if not config.bitcoind_path:
         print("Error: bitcoind path is required", file=sys.stderr)
         print("Provide via --bitcoind, config file, or FIBRE_BITCOIND_PATH env var", file=sys.stderr)
+        sys.exit(1)
+
+    if bool(config.tls_cert) != bool(config.tls_key):
+        print("Error: --tls-cert and --tls-key must both be provided", file=sys.stderr)
         sys.exit(1)
 
     # Run exporter
