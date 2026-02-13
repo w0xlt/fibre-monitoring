@@ -73,6 +73,8 @@ sudo .venv/bin/python3 fibre_exporter.py \
 | `--log-level` | No | INFO | Log level (DEBUG, INFO, WARNING, ERROR) |
 | `--metrics-auth-username` | No | - | Basic auth username for /metrics endpoint |
 | `--metrics-auth-password` | No | - | Basic auth password for /metrics endpoint |
+| `--tls-cert` | No | - | Path to TLS certificate file (enables HTTPS) |
+| `--tls-key` | No | - | Path to TLS private key file |
 | `--version` | No | - | Show version and exit |
 
 *Required unless provided via config file or environment variable.
@@ -99,6 +101,10 @@ log_level: INFO
 # Optional: Enable basic auth for /metrics endpoint
 metrics_auth_username: prometheus
 metrics_auth_password: changeme
+
+# Optional: Enable TLS (see "TLS Encryption" section below)
+tls_cert: /etc/fibre-exporter/node.crt
+tls_key: /etc/fibre-exporter/node.key
 ```
 
 ### Environment Variables
@@ -116,6 +122,8 @@ All settings can also be configured via environment variables:
 | `FIBRE_LOG_LEVEL` | Log level (DEBUG, INFO, WARNING, ERROR) |
 | `FIBRE_METRICS_AUTH_USERNAME` | Basic auth username for /metrics endpoint |
 | `FIBRE_METRICS_AUTH_PASSWORD` | Basic auth password for /metrics endpoint |
+| `FIBRE_TLS_CERT` | Path to TLS certificate file |
+| `FIBRE_TLS_KEY` | Path to TLS private key file |
 
 Configuration priority (highest to lowest):
 1. Command-line arguments
@@ -258,6 +266,99 @@ scrape_configs:
 
 **Note:** Both username and password must be set to enable authentication. The health check endpoint (`/health`) does not require authentication.
 
+**Warning:** Basic auth without TLS sends credentials in plaintext over the wire. If Prometheus and the exporter are on different machines, enable TLS (see below) or restrict access via firewall rules.
+
+### TLS Encryption
+
+For multi-node setups where Prometheus scrapes exporters over the network, enable TLS to encrypt traffic (including basic auth credentials).
+
+#### 1. Generate certificates
+
+The included `generate-certs.sh` script creates a self-signed CA and per-node certificates with IP SANs:
+
+```bash
+# Pass all node IPs as arguments
+./generate-certs.sh 192.168.1.10 192.168.1.11 192.168.1.12
+```
+
+This creates:
+```
+certs/
+  ca.crt              # Give this to Prometheus
+  ca.key              # Keep safe — only needed to sign new node certs
+  192.168.1.10/
+    node.crt           # Copy to that node
+    node.key           # Copy to that node
+  192.168.1.11/
+    ...
+```
+
+The script is idempotent — re-running it reuses the existing CA and skips nodes that already have certs. To add a new node later, just run it again with the new IP:
+
+```bash
+./generate-certs.sh 192.168.1.13
+```
+
+#### 2. Distribute certificates
+
+Copy each node's cert and key to that machine:
+
+```bash
+scp certs/192.168.1.10/node.{crt,key} user@192.168.1.10:/etc/fibre-exporter/
+```
+
+#### 3. Start the exporter with TLS
+
+```bash
+sudo .venv/bin/python3 fibre_exporter.py \
+  --bitcoind /path/to/bitcoind \
+  --tls-cert /etc/fibre-exporter/node.crt \
+  --tls-key  /etc/fibre-exporter/node.key \
+  --metrics-auth-username prometheus \
+  --metrics-auth-password your_secure_password
+```
+
+The exporter will log:
+```
+TLS enabled: cert=/etc/fibre-exporter/node.crt
+Prometheus metrics: https://0.0.0.0:9435/metrics
+```
+
+#### 4. Configure Prometheus
+
+Mount the CA certificate into the Prometheus container by adding it to the volumes in `docker/docker-compose.yml`:
+
+```yaml
+services:
+  prometheus:
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ../certs/ca.crt:/etc/prometheus/fibre-ca.crt:ro   # TLS CA cert
+      - prometheus_data:/prometheus
+```
+
+Then update `docker/prometheus/prometheus.yml` to scrape over HTTPS:
+
+```yaml
+scrape_configs:
+  - job_name: 'fibre'
+    scheme: https
+    tls_config:
+      ca_file: /etc/prometheus/fibre-ca.crt
+    basic_auth:
+      username: 'prometheus'
+      password: 'your_secure_password'
+    static_configs:
+      - targets: ['192.168.1.10:9435', '192.168.1.11:9435']
+```
+
+Restart the stack to apply:
+
+```bash
+docker compose -f docker/docker-compose.yml down
+docker compose -f docker/docker-compose.yml up -d
+```
+
 ## Managing the Stack
 
 ```bash
@@ -390,6 +491,7 @@ sudo journalctl -u fibre-exporter -f
 fibre-monitoring/
 ├── fibre_exporter.py              # Main metrics exporter
 ├── fibre-exporter.service         # Systemd service file
+├── generate-certs.sh              # TLS certificate generator
 ├── config.example.yaml            # Example configuration file
 ├── README.md                       # This file
 └── docker/
