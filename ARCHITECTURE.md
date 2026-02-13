@@ -4,10 +4,9 @@ This document explains the architecture of the FIBRE Monitoring system, its comp
 
 ## Overview
 
-The FIBRE Monitoring system is a metrics and logging pipeline that captures block relay performance data from a Bitcoin node and visualizes it through Grafana dashboards. It compares two block propagation mechanisms:
+The FIBRE Monitoring system is a metrics pipeline that captures FIBRE/UDP block relay performance data from a Bitcoin node and visualizes it through Grafana dashboards.
 
 - **FIBRE/UDP**: Fast Internet Bitcoin Relay Engine - a UDP-based protocol for low-latency block propagation
-- **BIP152 Compact Blocks**: The standard Bitcoin peer-to-peer compact block relay
 
 ## System Architecture
 
@@ -26,32 +25,23 @@ The FIBRE Monitoring system is a metrics and logging pipeline that captures bloc
 │  │     (port 9435)     │         │            every 10s                │    │
 │  └─────────────────────┘         └─────────────────────────────────────┘    │
 │                                                     │                       │
-│  ┌─────────────────────┐                            │                       │
-│  │ ~/.bitcoin/debug.log│                            │                       │
-│  └──────────┬──────────┘                            │                       │
-│             │                                       │                       │
-└─────────────┼───────────────────────────────────────┼───────────────────────┘
-              │                                       │
-              │ ┌─────────────────────────────────────┼─────────────────────┐
-              │ │              DOCKER NETWORK         │                     │
-              │ │                                     │                     │
-              │ │  ┌──────────────┐                   │                     │
-              │ │  │   Promtail   │                   │                     │
-              └─┼──►  (log agent) │                   │                     │
-                │  └──────┬───────┘                   │                     │
-                │         │                           │                     │
-                │         ▼                           ▼                     │
-                │  ┌──────────────┐           ┌──────────────┐              │
-                │  │     Loki     │           │  Prometheus  │              │
-                │  │ (port 3100)  │           │ (port 9090)  │              │
-                │  └──────┬───────┘           └──────┬───────┘              │
-                │         │                          │                      │
-                │         │    ┌─────────────────┐   │                      │
-                │         └───►│     Grafana     │◄──┘                      │
-                │              │   (port 3000)   │                          │
-                │              └─────────────────┘                          │
-                │                                                           │
-                └───────────────────────────────────────────────────────────┘
+└─────────────────────────────────────────────────────┼───────────────────────┘
+                                                      │
+              ┌───────────────────────────────────────┼─────────────────────┐
+              │              DOCKER NETWORK            │                     │
+              │                                       │                     │
+              │                                       ▼                     │
+              │                                ┌──────────────┐             │
+              │                                │  Prometheus  │             │
+              │                                │ (port 9090)  │             │
+              │                                └──────┬───────┘             │
+              │                                       │                     │
+              │                                ┌──────┴───────┐             │
+              │                                │    Grafana   │             │
+              │                                │ (port 3000)  │             │
+              │                                └──────────────┘             │
+              │                                                             │
+              └─────────────────────────────────────────────────────────────┘
 ```
 
 ## Components
@@ -63,12 +53,12 @@ The Bitcoin daemon with FIBRE patches and USDT (Userland Statically Defined Trac
 **Role**: Source of all block relay events
 
 **USDT Tracepoints exposed**:
-| Tracepoint | Description |
-|------------|-------------|
-| `block_reconstructed` | Fired when a block is successfully reconstructed via FIBRE/UDP |
-| `block_send_start` | Fired when the node starts sending a block to peers |
-| `block_race_winner` | Fired when a block race is decided (FIBRE vs Compact Blocks) |
-| `block_race_time` | Fired with timing data for both propagation mechanisms |
+| Tracepoint | Provider | Description |
+|------------|----------|-------------|
+| `block_reconstructed` | udp | Fired when a block is successfully reconstructed via FIBRE/UDP |
+| `block_send_start` | udp | Fired when the node starts sending a block to peers |
+| `block_race_winner` | udp | Fired on block delivery — records mechanism and peer |
+| `block_connected` | validation | Fired when any block is connected to the chain |
 
 **Requirements**:
 - Compiled with `--enable-usdt` configure flag
@@ -123,10 +113,13 @@ fibre_blocks_reconstructed_total{node="mynode"} 42
 fibre_block_reconstruction_duration_seconds_bucket{...}
 fibre_block_chunks_used_bucket{...}
 
-# Race results
-fibre_block_race_wins_total{node="mynode",mechanism="fibre_udp"} 35
-fibre_block_race_wins_total{node="mynode",mechanism="bip152_cmpct"} 7
-fibre_block_race_latency_seconds_bucket{...}
+# Block deliveries
+fibre_block_deliveries_total{node="mynode",mechanism="fibre_udp",peer="1.2.3.4:8333"} 35
+
+# Block connection (all delivery paths)
+bitcoin_blocks_connected_total{node="mynode"} 100
+bitcoin_block_connection_duration_seconds_bucket{...}
+bitcoin_block_tx_count_bucket{...}
 
 # Current state
 fibre_last_block_height{node="mynode"} 876543
@@ -183,86 +176,21 @@ scrape_configs:
 
 ---
 
-### 4. Loki
+### 4. Grafana
 
-A log aggregation system designed for efficiency and ease of use.
-
-**Role**: Centralized log storage and querying
-
-**How it works**:
-```
-┌─────────────────────────────────────────────────────┐
-│                       Loki                          │
-│                                                     │
-│  ┌─────────────┐    ┌─────────────┐    ┌─────────┐  │
-│  │   Ingester  │───►│   Storage   │◄───│ LogQL   │  │
-│  │             │    │  (chunks)   │    │ (query) │  │
-│  └──────▲──────┘    └─────────────┘    └────┬────┘  │
-│         │                                   │       │
-│         │ push logs                         │       │
-│         │                                   ▼       │
-│  ┌──────┴──────┐                      ┌─────────┐   │
-│  │  Promtail   │                      │ Grafana │   │
-│  └─────────────┘                      └─────────┘   │
-│                                                     │
-└─────────────────────────────────────────────────────┘
-```
-
-**Key Concepts**:
-- **Push-based**: Unlike Prometheus, Loki receives logs pushed by agents (Promtail)
-- **Labels**: Logs are indexed by labels (e.g., `{job="bitcoin", filename="/var/log/bitcoin/debug.log"}`)
-- **LogQL**: Query language similar to PromQL but for logs
-
----
-
-### 5. Promtail
-
-A log shipping agent that sends logs to Loki.
-
-**Role**: Collect and forward Bitcoin debug logs
-
-**How it works**:
-```
-┌─────────────────────────────────────────────────────────────┐
-│                        Promtail                             │
-│                                                             │
-│  ┌─────────────────┐    ┌─────────────┐    ┌─────────────┐  │
-│  │  File Discovery │───►│   Tailer    │───►│   Pusher    │  │
-│  │  (debug.log)    │    │  (follow)   │    │  (to Loki)  │  │
-│  └─────────────────┘    └─────────────┘    └─────────────┘  │
-│                                                             │
-└─────────────────────────────────────────────────────────────┘
-```
-
-**Configuration** (`promtail.yml`):
-```yaml
-scrape_configs:
-  - job_name: bitcoin
-    static_configs:
-      - targets: [localhost]
-        labels:
-          job: bitcoin
-          __path__: /var/log/bitcoin/debug.log
-```
-
----
-
-### 6. Grafana
-
-A visualization platform for metrics and logs.
+A visualization platform for metrics dashboards.
 
 **Role**: Dashboards, alerting, and data exploration
 
 **Data Sources**:
 | Source | Type | Purpose |
 |--------|------|---------|
-| Prometheus | Metrics | FIBRE performance metrics, race statistics |
-| Loki | Logs | Bitcoin debug log exploration |
+| Prometheus | Metrics | FIBRE performance metrics, block connection stats |
 
 **Dashboard Features**:
-- Block race win rates (FIBRE vs Compact Blocks)
-- Reconstruction time histograms
-- Latency percentiles (p50, p95, p99)
+- Block reconstruction time histograms
+- Block delivery tracking by mechanism and peer
+- Block connection performance (time, tx count)
 - Chunk efficiency metrics
 - Real-time block height tracking
 
@@ -301,29 +229,6 @@ A visualization platform for metrics and logs.
    Graphs, gauges, and tables update in real-time
 ```
 
-### Logs Flow (Debug Information)
-
-```
-1. bitcoind Writes Log
-   Debug message written to ~/.bitcoin/debug.log
-         │
-         ▼
-2. Promtail Tails File
-   Detects new lines, parses timestamps
-         │
-         ▼
-3. Promtail Pushes to Loki
-   Batched log entries with labels
-         │
-         ▼
-4. Loki Indexes and Stores
-   Chunks stored, labels indexed
-         │
-         ▼
-5. Grafana Queries Loki
-   LogQL queries filter and display logs
-```
-
 ---
 
 ## Network Architecture
@@ -333,12 +238,12 @@ A visualization platform for metrics and logs.
 │                         Docker Network                              │
 │                       (fibre-network)                               │
 │                                                                     │
-│  ┌───────────┐   ┌───────────┐   ┌───────────┐   ┌───────────┐      │
-│  │ prometheus│   │   loki    │   │  promtail │   │  grafana  │      │
-│  │   :9090   │   │   :3100   │   │   :9080   │   │   :3000   │      │
-│  └─────┬─────┘   └─────┬─────┘   └─────┬─────┘   └─────┬─────┘      │
-│        │               │               │               │            │
-│        └───────────────┴───────────────┴───────────────┘            │
+│            ┌───────────┐               ┌───────────┐                │
+│            │ prometheus│               │  grafana  │                │
+│            │   :9090   │               │   :3000   │                │
+│            └─────┬─────┘               └─────┬─────┘                │
+│                  │                           │                      │
+│                  └───────────────────────────┘                      │
 │                              │                                      │
 └──────────────────────────────┼──────────────────────────────────────┘
                                │
@@ -347,13 +252,13 @@ A visualization platform for metrics and logs.
 ┌──────────────────────────────┼──────────────────────────────────────┐
 │                         HOST MACHINE                                │
 │                               │                                     │
-│     ┌─────────────────────────┼─────────────────────────┐           │
-│     │                         │                         │           │
-│     ▼                         ▼                         ▼           │
-│ ┌─────────┐           ┌──────────────┐          ┌─────────────┐     │
-│ │bitcoind │           │fibre_exporter│          │ debug.log   │     │
-│ │         │◄──────────│    :9435     │          │ (mounted)   │     │
-│ └─────────┘   eBPF    └──────────────┘          └─────────────┘     │
+│     ┌─────────────────────────┘                                     │
+│     │                                                               │
+│     ▼                                                               │
+│ ┌─────────┐           ┌──────────────┐                              │
+│ │bitcoind │◄──────────│fibre_exporter│                              │
+│ │         │   eBPF    │    :9435     │                              │
+│ └─────────┘           └──────────────┘                              │
 │                                                                     │
 └─────────────────────────────────────────────────────────────────────┘
 ```
@@ -363,7 +268,6 @@ A visualization platform for metrics and logs.
 |------|---------|--------|
 | 3000 | Grafana | External (browser) |
 | 9090 | Prometheus | External (optional) |
-| 3100 | Loki | Internal only |
 | 9435 | FIBRE Exporter | Host + Docker |
 | 9436 | Exporter Health | Host only |
 
@@ -454,6 +358,4 @@ Each node runs its own exporter, and a central Prometheus instance scrapes all o
 | eBPF | Kernel 4.4+ | Efficient kernel tracing |
 | Prometheus | v3.x | Metrics storage |
 | Grafana | v12.x | Visualization |
-| Loki | v3.x | Log aggregation |
-| Promtail | v3.x | Log shipping |
 | Docker | 20.10+ | Container orchestration |

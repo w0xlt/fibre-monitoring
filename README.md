@@ -1,14 +1,14 @@
 # FIBRE Monitoring
 
-Real-time monitoring solution for FIBRE block relay performance in Bitcoin nodes. Compares FIBRE/UDP vs BIP152 compact block propagation using eBPF tracing and Prometheus/Grafana visualization.
+Real-time monitoring solution for FIBRE block relay performance in Bitcoin nodes. Tracks FIBRE/UDP block propagation using eBPF tracing and Prometheus/Grafana visualization.
 
 ## Overview
 
 This project captures and visualizes:
-- Block reconstruction performance metrics
-- Block relay race winners (FIBRE/UDP vs Compact Blocks)
-- Latency and reconstruction times
-- Chunk usage efficiency
+- Block reconstruction performance (timing, chunk efficiency)
+- Block delivery tracking by mechanism and peer
+- Block connection metrics (connection time, transaction count)
+- Blocks sent via FIBRE/UDP
 
 ## Architecture
 
@@ -18,8 +18,6 @@ bitcoind (with USDT probes)
 fibre_exporter.py (:9435)
     ↓ [Prometheus scrapes]
 Prometheus (:9090) → Grafana (:3000)
-    ↑
-Loki (:3100) ← Promtail (bitcoin debug.log)
 ```
 
 ## Prerequisites
@@ -71,6 +69,7 @@ sudo .venv/bin/python3 fibre_exporter.py \
 | `--config`, `-c` | No | - | Path to YAML config file |
 | `--verbose`, `-v` | No | false | Log individual events |
 | `--log-level` | No | INFO | Log level (DEBUG, INFO, WARNING, ERROR) |
+| `--log-file` | No | - | Path to log file (logs to both stdout and file) |
 | `--metrics-auth-username` | No | - | Basic auth username for /metrics endpoint |
 | `--metrics-auth-password` | No | - | Basic auth password for /metrics endpoint |
 | `--tls-cert` | No | - | Path to TLS certificate file (enables HTTPS) |
@@ -135,12 +134,12 @@ Configuration priority (highest to lowest):
 
 Once running, you should see output like:
 ```
-2024-01-15 10:30:00 [INFO] fibre_exporter: FIBRE USDT Metrics Exporter v1.1.0
+2024-01-15 10:30:00 [INFO] fibre_exporter: FIBRE USDT Metrics Exporter v1.2.0
 2024-01-15 10:30:00 [INFO] fibre_exporter: Configuration: bitcoind=/path/to/bitcoind node=mynode port=9435
 2024-01-15 10:30:00 [INFO] fibre_exporter: Attached probe: udp:block_reconstructed
 2024-01-15 10:30:00 [INFO] fibre_exporter: Attached probe: udp:block_send_start
 2024-01-15 10:30:00 [INFO] fibre_exporter: Attached probe: udp:block_race_winner
-2024-01-15 10:30:00 [INFO] fibre_exporter: Attached probe: udp:block_race_time
+2024-01-15 10:30:00 [INFO] fibre_exporter: Attached probe: validation:block_connected
 2024-01-15 10:30:00 [INFO] fibre_exporter: Attached 4/4 probes successfully
 2024-01-15 10:30:00 [INFO] fibre_exporter: Prometheus metrics: http://0.0.0.0:9435/metrics
 2024-01-15 10:30:00 [INFO] fibre_exporter: Health check: http://0.0.0.0:9436/health
@@ -149,8 +148,8 @@ Once running, you should see output like:
 
 With `--verbose` mode, individual events are also logged:
 ```
-2024-01-15 10:35:12 [INFO] fibre_exporter: Race winner: height=876543 winner=fibre_udp
-2024-01-15 10:35:12 [INFO] fibre_exporter: Race time: height=876543 udp=0.045s cmpct=0.089s
+2024-01-15 10:35:12 [INFO] fibre_exporter: Block delivery: height=876543 mechanism=fibre_udp peer=1.2.3.4:8333
+2024-01-15 10:35:12 [INFO] fibre_exporter: Block connected: height=876543 tx_count=2847 connection_time=12.3ms
 ```
 
 Test endpoints:
@@ -182,14 +181,12 @@ GRAFANA_ADMIN_PASSWORD=your_secure_password
 
 # Optional (with defaults)
 GRAFANA_ADMIN_USER=admin
-BITCOIN_DATA_DIR=/home/node/.bitcoin
 ```
 
 | Variable | Required | Default | Description |
 |----------|----------|---------|-------------|
 | `GRAFANA_ADMIN_PASSWORD` | Yes | - | Grafana admin password |
 | `GRAFANA_ADMIN_USER` | No | admin | Grafana admin username |
-| `BITCOIN_DATA_DIR` | No | /home/node/.bitcoin | Bitcoin data directory for log collection |
 
 ### 2. Start the Stack
 
@@ -425,8 +422,6 @@ cp .env.example .env
 ```bash
 docker compose logs prometheus
 docker compose logs grafana
-docker compose logs loki
-docker compose logs promtail
 ```
 
 ### Reset everything
@@ -460,19 +455,24 @@ sudo journalctl -u fibre-exporter -f
 
 ### FIBRE Metrics
 
-| Metric | Type | Description |
-|--------|------|-------------|
-| `fibre_blocks_reconstructed_total` | Counter | Total blocks reconstructed via FIBRE/UDP |
-| `fibre_block_reconstruction_duration_seconds` | Histogram | Block reconstruction time |
-| `fibre_block_chunks_used` | Histogram | Chunks used per block |
-| `fibre_chunks_received_total` | Counter | Total chunks received |
-| `fibre_chunks_used_total` | Counter | Total chunks used |
-| `fibre_blocks_sent_total` | Counter | Total blocks sent |
-| `fibre_block_race_wins_total` | Counter | Race wins by mechanism |
-| `fibre_block_race_latency_seconds` | Histogram | Latency by mechanism |
-| `fibre_race_margin_seconds` | Histogram | Race winning margin |
-| `fibre_races_with_both_total` | Counter | Races where both mechanisms participated |
-| `fibre_last_block_height` | Gauge | Height of most recently processed block |
+| Metric | Type | Labels | Description |
+|--------|------|--------|-------------|
+| `fibre_blocks_reconstructed_total` | Counter | node | Total blocks reconstructed via FIBRE/UDP |
+| `fibre_block_reconstruction_duration_seconds` | Histogram | node | Block reconstruction time |
+| `fibre_block_chunks_used` | Histogram | node | Chunks used per block |
+| `fibre_chunks_received_total` | Counter | node | Total chunks received |
+| `fibre_chunks_used_total` | Counter | node | Total chunks used |
+| `fibre_blocks_sent_total` | Counter | node | Total blocks sent via FIBRE/UDP |
+| `fibre_block_deliveries_total` | Counter | node, mechanism, peer | Block deliveries by mechanism and peer |
+| `fibre_last_block_height` | Gauge | node | Height of most recently processed block |
+
+### Block Connection Metrics
+
+| Metric | Type | Labels | Description |
+|--------|------|--------|-------------|
+| `bitcoin_blocks_connected_total` | Counter | node | Total blocks connected to the chain (all delivery paths) |
+| `bitcoin_block_connection_duration_seconds` | Histogram | node | Time to connect a block to the chain |
+| `bitcoin_block_tx_count` | Histogram | node | Number of transactions per connected block |
 
 ### Exporter Self-Monitoring Metrics
 
@@ -494,18 +494,16 @@ fibre-monitoring/
 ├── generate-certs.sh              # TLS certificate generator
 ├── config.example.yaml            # Example configuration file
 ├── README.md                       # This file
+├── ARCHITECTURE.md                 # Architecture documentation
 └── docker/
     ├── docker-compose.yml          # Container orchestration
     ├── .env.example                # Environment variables template
     ├── prometheus/
     │   └── prometheus.yml          # Prometheus scrape config
-    ├── promtail/
-    │   └── promtail.yml            # Log collection config
     └── grafana/
         └── provisioning/
             ├── datasources/
-            │   ├── prometheus.yml  # Prometheus datasource
-            │   └── loki.yml        # Loki datasource
+            │   └── prometheus.yml  # Prometheus datasource
             └── dashboards/
                 ├── dashboard.yml   # Dashboard provisioner
                 └── fibre-dashboard.json  # Pre-built dashboard

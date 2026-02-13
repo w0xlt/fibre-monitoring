@@ -28,7 +28,6 @@ GRAFANA_ADMIN_PASSWORD=your_secure_password
 
 # Optional
 GRAFANA_ADMIN_USER=admin
-BITCOIN_DATA_DIR=/home/node/.bitcoin
 ```
 
 ### 3. Start Prometheus and Grafana
@@ -52,7 +51,6 @@ docker compose up -d
 |----------|----------|---------|-------------|
 | `GRAFANA_ADMIN_PASSWORD` | Yes | - | Grafana admin password |
 | `GRAFANA_ADMIN_USER` | No | admin | Grafana admin username |
-| `BITCOIN_DATA_DIR` | No | /home/node/.bitcoin | Bitcoin data directory for log collection |
 
 ## Services
 
@@ -60,8 +58,6 @@ docker compose up -d
 |---------|------|-------------|
 | Prometheus | 9090 | Metrics storage and queries |
 | Grafana | 3000 | Visualization dashboard |
-| Loki | 3100 | Log aggregation |
-| Promtail | - | Log collection agent |
 | FIBRE Exporter | 9435 | Runs on host (not in Docker) |
 
 ## File Structure
@@ -72,13 +68,10 @@ docker/
 ├── .env.example                # Environment variables template
 ├── prometheus/
 │   └── prometheus.yml          # Prometheus scrape config
-├── promtail/
-│   └── promtail.yml            # Log collection config
 └── grafana/
     └── provisioning/
         ├── datasources/
-        │   ├── prometheus.yml  # Prometheus datasource
-        │   └── loki.yml        # Loki datasource
+        │   └── prometheus.yml  # Prometheus datasource
         └── dashboards/
             ├── dashboard.yml   # Dashboard provisioner config
             └── fibre-dashboard.json  # The actual dashboard
@@ -156,8 +149,6 @@ open http://localhost:9090/targets
 ```bash
 docker compose logs prometheus
 docker compose logs grafana
-docker compose logs loki
-docker compose logs promtail
 ```
 
 ### Reset everything
